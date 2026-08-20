@@ -4,9 +4,10 @@
 loader (legacy CSV-staging+INSERT and the DataX hdfswriter path alike) -
 TDCH/Sqoop precedent and this pipeline's own validated experience both
 confirm TPT/FastExport, not generic JDBC, is the right idiom for
-Teradata at volume.
+Teradata at volume. Relocated unchanged from tpt_export.py.
 """
 
+import re
 import subprocess
 import tempfile
 import time
@@ -30,8 +31,19 @@ class ObsConfig:
     endpoint: str
 
 
-def _build_tpt_job_script(columns: List[ResolvedColumn]) -> str:
+def _build_tpt_job_script(columns: List[ResolvedColumn], num_instances: int = 1) -> str:
     schema_lines = ",\n    ".join(f"{name} {tpt_type}" for name, tpt_type, _ in columns)
+    # Multiple FILE_WRITER instances writing to `num_instances` output files
+    # in parallel, round-robin-distributed by `tbuild -C` (see export()).
+    # Validated 2026-08-20 against 2M real rows: exact instance count of
+    # files, near-even row distribution, 0 rows lost - this is what makes
+    # a single export produce several files DataX can read in parallel,
+    # with no local re-read/re-split pass needed afterward. Confirmed this
+    # genuinely requires volume to kick in - a small (~2K row) test landed
+    # everything in instance 1, since round-robin operates at the transport
+    # block level, not per-row; real loads are always far larger than one
+    # block, so this isn't a concern in practice.
+    apply_target = f"FILE_WRITER[{num_instances}]" if num_instances > 1 else "FILE_WRITER"
     return f"""DEFINE JOB EXPORT_TABLE_JOB
 DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
 (
@@ -65,24 +77,31 @@ DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
     VARCHAR IndicatorMode = 'N'
   );
 
-  APPLY TO OPERATOR (FILE_WRITER)
+  APPLY TO OPERATOR ({apply_target})
   SELECT * FROM OPERATOR (EXPORT_OP);
 );
 """
 
 
 def build_select_stmt(
-    schema: str, table: str, columns: List[ResolvedColumn], row_limit: int = 0
+    schema: str,
+    table: str,
+    columns: List[ResolvedColumn],
+    row_limit: int = 0,
+    where_clause: str = "",
 ) -> str:
     """Build the TPT EXPORT operator's SelectStmt. `row_limit` is for
-    scratch/proof runs only (TOP N) - production exports the full table,
-    the WHERE/date-scoping is handled upstream by the table's own config."""
+    scratch/proof runs only (TOP N). `where_clause` scopes the export to
+    one dynamic-partition value (e.g. "DATE_KEY = 7901") - TPT does the
+    partitioning itself via one export per distinct value, rather than a
+    single full export split apart afterward in Python."""
     exprs = [
         f"CAST({name} AS FLOAT) AS {name}" if needs_cast else name
         for name, _, needs_cast in columns
     ]
     top_clause = f"TOP {row_limit} " if row_limit else ""
-    return f"SELECT {top_clause}{', '.join(exprs)} FROM {schema}.{table};"
+    where_sql = f" WHERE {where_clause}" if where_clause else ""
+    return f"SELECT {top_clause}{', '.join(exprs)} FROM {schema}.{table}{where_sql};"
 
 
 class TPTExporter:
@@ -114,11 +133,19 @@ class TPTExporter:
         table: str,
         columns: List[ResolvedColumn],
         row_limit: int = 0,
-    ) -> Path:
-        """Export `schema.table` to a local CSV under output_dir, return its path."""
-        output_file = f"{table.lower()}.csv"
-        job_script = _build_tpt_job_script(columns)
-        select_stmt = build_select_stmt(schema, table, columns, row_limit)
+        where_clause: str = "",
+        num_instances: int = 1,
+        file_label: str = "",
+    ) -> List[Path]:
+        """Export `schema.table` to num_instances local CSV file(s) under
+        output_dir, return their paths. `where_clause` scopes to one
+        partition value; `file_label` keeps output filenames distinct
+        across multiple export() calls for the same table (e.g. one call
+        per distinct partition value) - required, since without it every
+        call would write to the same filename and overwrite the last."""
+        base_name = f"{table.lower()}{'_' + file_label if file_label else ''}.csv"
+        job_script = _build_tpt_job_script(columns, num_instances)
+        select_stmt = build_select_stmt(schema, table, columns, row_limit, where_clause)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -138,13 +165,14 @@ class TPTExporter:
                 f"UserPassword='{self.td_password}'\n"
                 f"SelectStmt='{select_stmt}'\n"
                 f"OutputDir='/tpt_output'\n"
-                f"OutputFile='{output_file}'\n"
+                f"OutputFile='{base_name}'\n"
             )
             # Container's internal user (ttuuser, uid 1001) isn't the host
             # user that wrote this file - needs to be world-readable.
             jobvars_file.chmod(0o644)
 
             job_name = f"export_{table.lower()}_{int(time.time())}"
+            cyclic_flag = ["-C"] if num_instances > 1 else []
             cmd = [
                 "docker", "run", "-d",
                 "-e", "accept_license=Y",
@@ -156,7 +184,7 @@ class TPTExporter:
                 "sudo /opt/teradata/client/20.00/bin/tdwallet installSoftware "
                 ">/dev/null 2>&1 || true; "
                 f"tbuild -f /tpt_scripts/export.tpt -j '{job_name}' "
-                "-v /tpt_scripts/jobvars.txt",
+                f"{' '.join(cyclic_flag)} -v /tpt_scripts/jobvars.txt",
             ]
             logger.info(f"Starting TPT export container for {schema}.{table}")
             start_result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -178,7 +206,9 @@ class TPTExporter:
                     capture_output=True, timeout=60,
                 )
 
-        return self.output_dir / output_file
+        if num_instances <= 1:
+            return [self.output_dir / base_name]
+        return [self.output_dir / f"{base_name}-{i}" for i in range(1, num_instances + 1)]
 
     def _wait_for_completion(
         self, container_id: str, schema: str, table: str, poll_interval: int = 15
@@ -196,7 +226,17 @@ class TPTExporter:
             if "completed successfully" in logs:
                 logger.info(f"TPT export completed for {schema}.{table}")
                 return
-            if "terminated (status" in logs or "compilation failed" in logs:
+            # "Job terminated with status N." (N != 0) is tbuild's own
+            # generic failure marker - broader than the two specific
+            # substrings this used to check for, which missed at least
+            # one real failure (TPT04187 malformed jobvars.txt, confirmed
+            # 2026-08-20) and would have spun for the full timeout instead
+            # of failing fast.
+            if (
+                "terminated (status" in logs
+                or "compilation failed" in logs
+                or re.search(r"Job terminated with status [1-9]", logs)
+            ):
                 raise RuntimeError(
                     f"TPT export failed for {schema}.{table}: {logs[-2000:]}"
                 )

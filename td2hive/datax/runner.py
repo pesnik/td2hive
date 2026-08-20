@@ -43,9 +43,26 @@ class DataxRunResult:
 
 
 class DataxRunner:
-    def __init__(self, datax_home: Path):
+    # datax.py hardcodes -Xms1g -Xmx1g as its DEFAULT_JVM. Fine for a
+    # laptop; on a real ingest host it just means smaller Parquet
+    # row-group buffers and more GC churn than necessary. datax.py's -j
+    # flag appends extra JVM args after the default, and the JVM honors
+    # the LAST -Xmx/-Xms seen, so passing a bigger pair here overrides the
+    # hardcoded default rather than conflicting with it.
+    #
+    # Raised from 16g/32g to 24g/64g after real production experience: a
+    # real 16-channel write against a ~565M-row, ~36-column table sat at
+    # ~29GB/32GB (91% of cap) mid-write on a 96-core/503GB host that was
+    # otherwise ~7% utilized - too close to the ceiling for comfort given
+    # an OOM mid-write means redoing the TPT export too (no partial-
+    # resume). 64g is still under 13% of total host memory. Tune down for
+    # a smaller host via jvm_opts.
+    DEFAULT_JVM_OPTS = "-Xms24g -Xmx64g"
+
+    def __init__(self, datax_home: Path, jvm_opts: str = DEFAULT_JVM_OPTS):
         self.datax_home = Path(datax_home)
         self.datax_py = self.datax_home / "bin" / "datax.py"
+        self.jvm_opts = jvm_opts
         if not self.datax_py.exists():
             raise FileNotFoundError(f"datax.py not found under {datax_home}")
 
@@ -62,7 +79,7 @@ class DataxRunner:
         log_path = job_dir / "datax_run.log"
         with open(log_path, "w") as log_file:
             proc = subprocess.run(
-                ["python3", str(self.datax_py), str(job_path)],
+                ["python3", str(self.datax_py), "-j", self.jvm_opts, str(job_path)],
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 timeout=3600,

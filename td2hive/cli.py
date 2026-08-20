@@ -164,7 +164,6 @@ def _run_job(
         obs_config=obs_config, obs_bucket=obs_bucket, audit_sink=audit_sink,
         paths=RunPaths(
             tpt_output_dir=run_id_dir / "tpt",
-            partition_split_dir=run_id_dir / "split",
             datax_logs_dir=Path("/data01/td2hive/logs/datax"),
         ),
         datax_home=datax_home,

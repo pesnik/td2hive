@@ -25,12 +25,19 @@ handling to the same mechanism:
   **bypassing Hive's query engine for the write entirely**. No custom
   DataX plugin — `txtfilereader` (reads TPT's local CSV output) paired
   with `hdfswriter` is the whole loading mechanism.
-- **Partition registration**: since td2hive already knows every distinct
-  partition value it wrote (it split the CSV by that value before ever
-  calling DataX), it registers each partition explicitly via `ALTER
-  TABLE ... ADD PARTITION` — never `MSCK REPAIR`'s directory-tree
-  auto-discovery, which in practice we found unreliable against at least
-  one real OBS backend.
+- **Partition registration**: td2hive queries every distinct dynamic
+  partition value up front (`SELECT DISTINCT`) and exports each value's
+  data separately — TPT does the partitioning itself, scoped by a `WHERE`
+  clause per value, rather than exporting the whole table once and
+  splitting it apart locally afterward. Since every value is known in
+  advance, it registers each partition explicitly via `ALTER TABLE ...
+  ADD PARTITION` — never `MSCK REPAIR`'s directory-tree auto-discovery,
+  which in practice we found unreliable against at least one real OBS
+  backend.
+- **Parallelism**: TPT's own `DataConnector` operator (`FILE_WRITER[n]`
+  + `tbuild -C`) writes each export directly into `n` files, round-robin
+  distributed, in one pass — no local re-read/re-split pass over data
+  that's already on disk just to fan it out across DataX channels.
 - **Verification**: an independent Teradata-source-count vs.
   Hive-target-count comparison is the *only* thing that ever sets
   success/failure. A loader's own self-reported row count is stored for
@@ -43,14 +50,18 @@ handling to the same mechanism:
 ## Architecture
 
 ```
-TPTExporter.export()        Teradata table -> local CSV (pipe-delimited)
+per distinct dynamic       (no-op, one pass: tables with no dynamic
+partition value:            partition column)
         │
         ▼
-split_csv_by_partition_value()   splits by dynamic partition column value
-        │                        (no-op for statically-partitioned tables)
+TPTExporter.export()        Teradata table, WHERE-scoped to one partition
+        │                    value -> n local CSVs in parallel
+        │                    (FILE_WRITER[n] + tbuild -C, round-robin)
         ▼
 datax.job_spec.build_job_json()  generates DataX's job.json:
         │                        txtfilereader -> hdfswriter
+        │                        (channel count = file count = real
+        │                         parallelism, no local re-split pass)
         ▼
 DataxRunner.run()            runs `datax.py`, parses its summary
         │                    (fast-fail signal only, not the verdict)
@@ -193,6 +204,14 @@ somewhere else (e.g. a venv). Set `TD2HIVE_HOST` instead of passing
 - **Storage and metadata are always two explicit, separately-verifiable
   steps.** Writing data and registering a Hive partition are never one
   operation that's assumed to imply the other.
+- **Re-running a job for the same date is safe by construction.** Each
+  target partition path is deleted before it's written to (once per
+  unique path per run, not per source table, so multiple load tables can
+  still share a partition directory within one run) — `hdfswriter`'s own
+  `writeMode` stays `append` precisely so nothing else also tries to
+  manage conflicts in the same directory. Local TPT-exported CSVs are
+  only ever deleted after `verify()` independently confirms a successful
+  write — kept on failure/mismatch for debugging.
 - **No assumptions about your audit/lineage destination.** Pluggable
   sinks (JSONL, any SQLAlchemy database, OpenLineage), composable, not
   exclusive.
