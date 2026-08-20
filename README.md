@@ -1,0 +1,202 @@
+# td2hive
+
+A Teradata → Hive (MRS / HetuEngine) backup pipeline: Teradata Parallel
+Transporter (TPT) extraction, [DataX](https://github.com/alibaba/DataX)
+(stock plugins only, no custom Java) loading, independent verification,
+and pluggable audit.
+
+## Why this exists
+
+A common, easy-to-miss failure mode: writing into a dynamically-partitioned
+Hive table via `INSERT ... PARTITION(dynamic_col)` can report success in
+seconds for hundreds of millions of rows — physically impossible — while
+writing zero real rows, with no error surfaced. The write path silently
+depends on HDFS/object-store permission and partition-discovery behavior
+that a component's own self-report doesn't reveal.
+
+td2hive avoids that failure mode structurally, not by adding more error
+handling to the same mechanism:
+
+- **Extraction**: [Teradata Parallel Transporter](https://github.com/Teradata/PT)
+  (wraps FastExport), the same idiom TDCH and Sqoop use for Teradata at
+  volume — not generic JDBC.
+- **Loading**: DataX's stock `hdfswriter` writes straight to your
+  target's OBS/HDFS partition path via the Hadoop `FileSystem` API,
+  **bypassing Hive's query engine for the write entirely**. No custom
+  DataX plugin — `txtfilereader` (reads TPT's local CSV output) paired
+  with `hdfswriter` is the whole loading mechanism.
+- **Partition registration**: since td2hive already knows every distinct
+  partition value it wrote (it split the CSV by that value before ever
+  calling DataX), it registers each partition explicitly via `ALTER
+  TABLE ... ADD PARTITION` — never `MSCK REPAIR`'s directory-tree
+  auto-discovery, which in practice we found unreliable against at least
+  one real OBS backend.
+- **Verification**: an independent Teradata-source-count vs.
+  Hive-target-count comparison is the *only* thing that ever sets
+  success/failure. A loader's own self-reported row count is stored for
+  telemetry but never trusted as the verdict — that's the direct lesson
+  of the bug above.
+- **Audit**: pluggable sinks (JSONL file, any SQLAlchemy-supported
+  database, OpenLineage) fan out via a `CompositeAuditSink` — a package
+  can't assume what audit/lineage destination you already run.
+
+## Architecture
+
+```
+TPTExporter.export()        Teradata table -> local CSV (pipe-delimited)
+        │
+        ▼
+split_csv_by_partition_value()   splits by dynamic partition column value
+        │                        (no-op for statically-partitioned tables)
+        ▼
+datax.job_spec.build_job_json()  generates DataX's job.json:
+        │                        txtfilereader -> hdfswriter
+        ▼
+DataxRunner.run()            runs `datax.py`, parses its summary
+        │                    (fast-fail signal only, not the verdict)
+        ▼
+PartitionRegistrar.add_partition()   explicit per-partition registration
+        │
+        ▼
+verify()                     independent Teradata vs. Hive count compare
+        │                    (the only thing that sets success/failure)
+        ▼
+AuditSink.record()           JSONL / SQL / OpenLineage, pluggable
+```
+
+## Installation
+
+```bash
+pip install td2hive
+# or, for a specific audit backend:
+pip install "td2hive[mysql]"       # SQLAuditSink against MySQL
+pip install "td2hive[postgres]"    # SQLAuditSink against Postgres
+pip install "td2hive[openlineage]" # OpenLineageAuditSink
+```
+
+You'll also need, on whatever host runs `td2hive run`:
+
+- **Docker**, with a `teradata/tpt` image available (Teradata's licensing
+  means you build/obtain this image yourself).
+- **A DataX distribution** containing at minimum the `writer/hdfswriter`
+  and `reader/txtfilereader` plugins, built from
+  [alibaba/DataX](https://github.com/alibaba/DataX). Stock `hdfswriter`
+  bundles Hadoop 2.7.1 client jars, which throw
+  `NoSuchMethodError`/`NoClassDefFoundError` against most modern (3.x)
+  Hadoop clusters — you will very likely need to swap in jars matching
+  your own cluster's Hadoop version and object-store connector. See
+  `td2hive/datax/distribution.py` for a worked example against one real
+  Hadoop 3.3.1 + Huawei OBS deployment, and
+  `scripts/package_datax_dist.sh` / `scripts/deploy_datax_dist.sh` for
+  packaging and deploying whatever distribution you end up with.
+- **`beeline`**, for partition registration and verification queries.
+
+## Quick start
+
+1. Write a job spec (see `td2hive/jobs/example_dim_table.yaml` and
+   `example_fact_table.yaml` for statically- and dynamically-partitioned
+   examples):
+
+   ```yaml
+   table_name: my_table
+   source:
+     teradata:
+       owner: STAGING_DB
+       load_tables: [MY_TABLE_STG]
+       columns: [ID, NAME, UPDATED_AT]
+   target:
+     hive:
+       owner: WAREHOUSE_DB
+       table: MY_TABLE
+     obs_dir: /warehouse.db/my_table
+     format: parquet
+     partitions: []
+   loader: datax
+   retention_days: 30   # omit to never expire this table's data
+   ```
+
+2. Run it:
+
+   ```bash
+   td2hive run \
+     --job jobs/my_table.yaml \
+     --processing-date 2026-01-15 \
+     --td-host ... --td-user ... --td-password ... \
+     --obs-access-key ... --obs-secret-key ... --obs-endpoint ... --obs-bucket ... \
+     --datax-home /path/to/your/datax/distribution
+   ```
+
+   Or run every DataX-loader job under a directory:
+
+   ```bash
+   td2hive run-all --jobs-dir jobs/ --processing-date 2026-01-15 ...
+   ```
+
+   Every option above can also come from an environment variable of the
+   same name (`TD_HOST`, `OBS_ACCESS_KEY`, `DATAX_HOME`, ...) — see
+   `td2hive/cli.py`.
+
+3. Check the audit trail (`--audit-jsonl`, default
+   `/data01/td2hive/logs/audit.jsonl`) or your configured SQL sink for
+   the result. `status` is `success` or `dq_mismatch`, decided entirely
+   by the independent count comparison in `verify.py`.
+
+## Retention
+
+```bash
+td2hive retention run --job jobs/my_table.yaml --obs-bucket ...       # dry-run (default)
+td2hive retention run --job jobs/my_table.yaml --obs-bucket ... --no-dry-run   # actually delete
+td2hive retention run-all --jobs-dir jobs/ --obs-bucket ...
+```
+
+Only tables with `retention_days` set in their job spec are touched.
+Every expiry action is dry-run by default — `--no-dry-run` must be passed
+explicitly to delete anything. OBS data is deleted first, then the Hive
+partition entry is dropped; if the OBS deletion fails, the Hive partition
+is deliberately left pointing at the now-partially-deleted data rather
+than silently orphaning metadata that still claims complete data exists.
+
+## Deployment
+
+`scripts/` has setup, promotion-gated deployment, rollback, and teardown
+for both the Python package and the DataX distribution:
+
+```bash
+scripts/deploy_app.sh <version> <ssh-host>          # ships td2hive itself
+scripts/package_datax_dist.sh <version> <datax-dist-dir>
+scripts/deploy_datax_dist.sh <version> <ssh-host>    # ships + smoke-tests DataX
+scripts/rollback.sh <app|datax> <version> <ssh-host> # instant symlink repoint
+scripts/teardown.sh <app|datax> <version> <ssh-host> # remove an old version
+```
+
+`deploy_datax_dist.sh` gates promotion on `scripts/smoke_test_datax_dist.py`
+actually writing to real object storage and independently verifying the
+result — a distribution that fails the smoke test is never symlinked to
+`current`.
+
+Both deploy scripts assume `python3` on the target host's `PATH` is
+already set up with td2hive's dependencies; set `TD2HIVE_PYTHON` if it's
+somewhere else (e.g. a venv). Set `TD2HIVE_HOST` instead of passing
+`ssh-host` on every command if you're deploying to one host repeatedly.
+
+## Design principles
+
+- **No hardcoded schema mapping.** Column types are always resolved
+  dynamically against `DBC.ColumnsV` at run time (`column_types.py`) -
+  never a maintained name→type table. This is what makes the package
+  usable against any Teradata schema.
+- **Never trust a component's own self-report as the verdict.** DataX's
+  summary, a Hive `INSERT`'s reported row count, an S3-compatible
+  client's "success" - none of these are trusted as ground truth
+  anywhere in this package. Every claim of "this data landed" is checked
+  independently before anything is marked successful.
+- **Storage and metadata are always two explicit, separately-verifiable
+  steps.** Writing data and registering a Hive partition are never one
+  operation that's assumed to imply the other.
+- **No assumptions about your audit/lineage destination.** Pluggable
+  sinks (JSONL, any SQLAlchemy database, OpenLineage), composable, not
+  exclusive.
+
+## License
+
+MIT - see [LICENSE](LICENSE).

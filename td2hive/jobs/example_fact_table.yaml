@@ -1,0 +1,40 @@
+# Example job spec for a fact table with a dynamic partition column - the
+# shape that needs td2hive's CSV-split-by-partition-value logic
+# (datax.job_spec.split_csv_by_partition_value): a single load can span
+# multiple values of EVENT_DATE_KEY, each needing its own
+# EVENT_DATE_KEY=<value>/ subdirectory so Hive can register them as
+# separate partitions.
+
+table_name: example_fact_table
+
+source:
+  teradata:
+    owner: STAGING_DB
+    load_tables:
+      - EXAMPLE_FACT_LD_1
+      - EXAMPLE_FACT_LD_2   # a job can span more than one source table
+  columns:
+    - CUSTOMER_ID
+    - EVENT_DATE_KEY
+    - EVENT_TYPE
+    - AMOUNT
+
+target:
+  hive:
+    owner: WAREHOUSE_DB
+    table: EXAMPLE_FACT_TABLE
+  obs_dir: /warehouse.db/example_fact_table
+  format: parquet
+  partitions:
+    - {column: EVENT_DATE_KEY, dynamic: true}
+
+loader: datax
+
+setting:
+  error_limit:
+    record: 0
+    percentage: 0.0
+  speed_channel: 1
+  write_mode: append
+
+# No retention_days set - this table's partitions are never expired.

@@ -1,0 +1,42 @@
+# Example job spec for a small, statically-partitioned dimension table.
+# Copy this per table you want td2hive to manage - one YAML file is the
+# full source of truth for that table's extraction, loading, and
+# retention behavior. See jobs/example_fact_table.yaml for a table with a
+# dynamic partition column.
+
+table_name: example_dim_table
+
+source:
+  teradata:
+    owner: STAGING_DB
+    load_tables:
+      - EXAMPLE_DIM_STG
+  columns:
+    - ID
+    - NAME
+    - CATEGORY
+    - UPDATED_AT
+
+target:
+  hive:
+    owner: WAREHOUSE_DB
+    table: EXAMPLE_DIM_TABLE
+  # Real OBS/S3 paths are lowercased automatically at load time
+  # regardless of the case used here - see jobspec.TargetSpec.
+  obs_dir: /warehouse.db/example_dim_table
+  format: parquet
+  partitions: []   # no partition columns - just processing_date, added automatically
+
+loader: datax   # datax | legacy_write_nos | legacy_tpt_csv_stage
+
+setting:
+  error_limit:
+    record: 0
+    percentage: 0.0
+  speed_channel: 1
+  write_mode: append
+
+# Days to retain processing_date partitions. Omit entirely (or leave out
+# this key) to never expire this table's data - retention is opt-in per
+# table, never implicit.
+retention_days: 30
