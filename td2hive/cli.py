@@ -350,6 +350,85 @@ def reconcile_cmd(
         raise SystemExit(1)
 
 
+@cli.command("create-target")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Draft (or promoted) job YAML describing the real target table to create")
+@click.option("--force", is_flag=True,
+              help="Replace an existing table's Hive metadata (DROP + CREATE) instead of refusing")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+def create_target_cmd(
+    job_path: Path, force: bool,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+):
+    """Create the REAL Hive table a job spec points at, if it doesn't
+    already exist yet. Neither `td2hive run` nor a typical legacy
+    pipeline does this automatically - job_runner.py only clears/writes
+    an existing target path and registers partitions against an
+    already-existing metastore entry; `td2hive validate` only ever
+    creates/drops a throwaway scratch table. This closes that gap for
+    genuinely new tables, whose real Hive table would otherwise need to
+    be created out-of-band by hand before either pipeline could touch it.
+
+    Refuses to touch an already-existing table unless --force is passed
+    - this creates real, permanent Hive metadata, not a scratch proof.
+    Passing --force drops and recreates the table DEFINITION only; the
+    underlying OBS data is never deleted (external tables never lose
+    data on DROP), but a column/partition mismatch against data already
+    written under this path can break reads until reconciled - so only
+    force this when intentionally correcting the DDL, not routinely.
+
+    Column types are resolved from Teradata (the same
+    resolve_column_types check a real run does - never guessed or
+    copied from a legacy config). Partition columns are processing_date
+    plus any dynamic partitions the job spec declares.
+
+    This only creates the table - it loads no data. Run `td2hive
+    validate` against the same draft next, or promote it and run a real
+    `td2hive run`, to actually populate it."""
+    job = load_jobspec(job_path)
+    registrar = PartitionRegistrar()
+
+    if registrar.table_exists(job.target.hive_owner, job.target.hive_table):
+        if not force:
+            raise click.ClickException(
+                f"{job.target.hive_owner}.{job.target.hive_table} already exists - refusing to "
+                f"touch it. Pass --force to replace its metadata (the underlying OBS data at "
+                f"{job.target.obs_dir} is never deleted - external tables don't lose data on "
+                f"DROP - but a column/partition mismatch against data already written there can "
+                f"break reads until reconciled)."
+            )
+        click.echo(
+            f"--force passed: {job.target.hive_owner}.{job.target.hive_table} already exists - "
+            f"replacing its metadata (data at {job.target.obs_dir} is not touched)."
+        )
+
+    conn = teradatasql.connect(host=td_host, user=td_user, password=td_password)
+    cursor = conn.cursor()
+    dynamic_partition_cols = {p.column.lower() for p in job.target.partitions if p.dynamic}
+    resolved = resolve_column_types(cursor, job.source.owner, job.source.load_tables, job.source.columns)
+    data_columns = [
+        (name, to_hive_type(tpt_type))
+        for name, tpt_type, _ in resolved
+        if name.lower() not in dynamic_partition_cols
+    ]
+    partition_columns = [("processing_date", "STRING")] + [
+        (p.column, "STRING") for p in job.target.partitions if p.dynamic
+    ]
+
+    location = f"obs://{obs_bucket}{job.target.obs_dir}"
+    registrar.create_external_table(
+        schema=job.target.hive_owner,
+        table=job.target.hive_table,
+        columns=data_columns,
+        location=location,
+        file_format=job.target.format.upper(),
+        partition_columns=partition_columns,
+    )
+    click.echo(f"Created {job.target.hive_owner}.{job.target.hive_table} at {location}")
+
+
 @cli.command("validate")
 @click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path),
               help="Draft job YAML - a table only belongs in jobs/ after this passes")

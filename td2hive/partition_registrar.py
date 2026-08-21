@@ -136,6 +136,16 @@ class PartitionRegistrar:
             columns.append((name, dtype))
         return columns
 
+    def table_exists(self, schema: str, table: str) -> bool:
+        """DESCRIBE on a nonexistent table fails (beeline exits nonzero,
+        _run_command raises) - treat that as "doesn't exist" rather than
+        propagating, since callers (create-target) need this as a plain
+        existence check, not an error signal."""
+        try:
+            return bool(self.describe_table(schema, table))
+        except Exception:
+            return False
+
     def drop_table(self, schema: str, table: str) -> None:
         try:
             self._execute_query(
