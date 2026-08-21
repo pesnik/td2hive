@@ -43,11 +43,11 @@ from td2hive.partition_registrar import PartitionRegistrar  # noqa: E402
 
 
 def _fetch_legacy_config(
-    mysql_host: str, mysql_user: str, mysql_password: str, mysql_database: str, table_name: str
+    mysql_host: str, mysql_port: int, mysql_user: str, mysql_password: str, mysql_database: str, table_name: str
 ) -> Optional[dict]:
     conn = pymysql.connect(
         host=mysql_host, user=mysql_user, password=mysql_password,
-        port=3306, database=mysql_database,
+        port=mysql_port, database=mysql_database,
     )
     try:
         with conn.cursor() as cur:
@@ -145,6 +145,7 @@ loader: datax
 @click.command()
 @click.argument("table_name")
 @click.option("--mysql-host", required=True, envvar="MYSQL_HOST")
+@click.option("--mysql-port", default=3306, envvar="MYSQL_PORT")
 @click.option("--mysql-user", required=True, envvar="MYSQL_USER")
 @click.option("--mysql-password", required=True, envvar="MYSQL_PASSWORD")
 @click.option("--mysql-database", default="monitoring", envvar="MYSQL_DATABASE")
@@ -153,10 +154,10 @@ loader: datax
 @click.option("--td-password", required=True, envvar="TD_PASSWORD")
 @click.option("--speed-channel", default=4, help="Conservative starting default - tune via `td2hive validate`")
 def main(
-    table_name: str, mysql_host: str, mysql_user: str, mysql_password: str, mysql_database: str,
+    table_name: str, mysql_host: str, mysql_port: int, mysql_user: str, mysql_password: str, mysql_database: str,
     td_host: str, td_user: str, td_password: str, speed_channel: int,
 ):
-    config = _fetch_legacy_config(mysql_host, mysql_user, mysql_password, mysql_database, table_name)
+    config = _fetch_legacy_config(mysql_host, mysql_port, mysql_user, mysql_password, mysql_database, table_name)
     if config is None:
         raise click.ClickException(
             f"No row in {mysql_database}.td_backcup_config with HIVE_TAB_NAME = {table_name!r}"
