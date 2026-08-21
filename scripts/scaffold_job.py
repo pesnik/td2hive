@@ -94,6 +94,23 @@ def _real_source_columns(
     return [name for name, _ in described if name.lower() not in exclude]
 
 
+def _teradata_source_columns(cursor, td_owner: str, load_table: str, static_partition_cols: List[str]) -> List[str]:
+    """Teradata's own physical column order (DBC.ColumnsV.ColumnId) for
+    one load table - the only fallback available for a genuinely new
+    table, whose Hive target doesn't exist yet and so has no real DDL
+    order to defer to instead. Once `td2hive create-target` creates the
+    real table from a draft built this way, every future re-scaffold of
+    the same table goes back to the real Hive DESCRIBE order via
+    _real_source_columns - this fallback only ever fires once, for the
+    table's first draft."""
+    cursor.execute(
+        "SELECT ColumnName FROM DBC.ColumnsV WHERE DatabaseName = ? AND TableName = ? ORDER BY ColumnId",
+        [td_owner, load_table],
+    )
+    exclude = {c.lower() for c in static_partition_cols}
+    return [name.strip() for (name,) in cursor.fetchall() if name.strip().lower() not in exclude]
+
+
 def _render_yaml(
     table_name: str, td_owner: str, load_tables: List[str], columns: List[str],
     hive_owner: str, hive_table: str, obs_dir: str, dynamic_partitions: List[str],
@@ -194,28 +211,47 @@ def main(
         )
 
     registrar = PartitionRegistrar()
-    real_columns = _real_source_columns(registrar, hive_owner, hive_table, static_partition_cols)
-    if not real_columns:
-        raise click.ClickException(
-            f"DESCRIBE {hive_owner}.{hive_table} returned no usable columns - "
-            f"does this Hive table exist, and is beeline reachable/authenticated here?"
-        )
-
-    # Pre-flight: every column Hive expects must actually exist (with a
-    # resolvable type) in the Teradata source tables - the same check
-    # td2hive's own real run does via resolve_column_types(), just run
-    # here so a typo'd/renamed column is caught before ever writing a
-    # draft, not after a real run fails partway through.
     td_conn = teradatasql.connect(host=td_host, user=td_user, password=td_password)
     try:
-        resolve_column_types(td_conn.cursor(), td_owner, load_tables, real_columns)
-    except ValueError as e:
-        raise click.ClickException(
-            f"Pre-flight check against Teradata failed: {e}\n"
-            f"Every column {hive_owner}.{hive_table}'s real DDL expects must exist, with a "
-            f"resolvable type, in {td_owner}.{{{', '.join(load_tables)}}} - fix the mismatch "
-            f"before this table can be scaffolded."
-        )
+        if registrar.table_exists(hive_owner, hive_table):
+            real_columns = _real_source_columns(registrar, hive_owner, hive_table, static_partition_cols)
+            if not real_columns:
+                raise click.ClickException(
+                    f"DESCRIBE {hive_owner}.{hive_table} returned no usable columns - "
+                    f"is beeline reachable/authenticated here?"
+                )
+        else:
+            click.echo(
+                f"NOTE: {hive_owner}.{hive_table} doesn't exist in Hive yet - falling back to "
+                f"{td_owner}.{load_tables[0]}'s own Teradata column order (DBC.ColumnsV) instead "
+                f"of a real Hive DDL, since there isn't one yet. Run `td2hive create-target` "
+                f"against the resulting draft to create the real table using exactly this order - "
+                f"any future re-scaffold of this table will then use the real Hive DESCRIBE order "
+                f"instead, same as every other already-onboarded table.",
+                err=True,
+            )
+            real_columns = _teradata_source_columns(td_conn.cursor(), td_owner, load_tables[0], static_partition_cols)
+            if not real_columns:
+                raise click.ClickException(
+                    f"DBC.ColumnsV returned no columns for {td_owner}.{load_tables[0]} - "
+                    f"does this table exist?"
+                )
+
+        # Pre-flight: every column must actually exist (with a resolvable
+        # type) in every Teradata source table - the same check td2hive's
+        # own real run does via resolve_column_types(), just run here so a
+        # typo'd/renamed column, or a mismatch across load tables, is
+        # caught before ever writing a draft, not after a real run fails
+        # partway through.
+        try:
+            resolve_column_types(td_conn.cursor(), td_owner, load_tables, real_columns)
+        except ValueError as e:
+            raise click.ClickException(
+                f"Pre-flight check against Teradata failed: {e}\n"
+                f"Every column must exist, with a resolvable type, in "
+                f"{td_owner}.{{{', '.join(load_tables)}}} - fix the mismatch before this table "
+                f"can be scaffolded."
+            )
     finally:
         td_conn.close()
 
