@@ -25,16 +25,25 @@ from .column_types import ResolvedColumn
 # field_delimiter). Not '|' - confirmed live: a real VARCHAR column
 # value containing a literal '|' (or an embedded newline) silently
 # misaligned every column after it, since DELIMITED text has no
-# quoting/escaping mechanism here. ASCII SOH (0x01) is the standard
-# choice for exactly this reason - the same reasoning Hive's own
-# default field delimiter uses it - real business text essentially
-# never contains a raw control character. Emitted as the Teradata hex
-# literal X'01' in the TPT script (a text literal, not a raw
-# non-printable byte embedded in the script file); DataX's job.json
-# gets this same character as a plain Python string value, which the
-# json module already escapes correctly on its own.
-FIELD_DELIMITER = "\x01"
-_TPT_TEXT_DELIMITER_LITERAL = "X'01'"
+# quoting/escaping mechanism here. ASCII Unit Separator (0x1F) is the
+# character the ASCII standard itself designates for exactly this
+# purpose (FS/GS/RS/US at 0x1C-0x1F are literally "hierarchical data
+# separators") - real business text essentially never contains a raw
+# control character.
+#
+# TPT's DataConnector operator does NOT accept a control character
+# through the plain TextDelimiter attribute at all (confirmed via
+# Teradata's own docs: "cannot be a control character other than a
+# tab") - a first attempt using TextDelimiter = X'01' (a Teradata SQL
+# hex literal) failed with TPT02954, since TPT's own job-script grammar
+# doesn't accept a hex literal as an attribute's Initial Value either.
+# The real, documented (if little-known) mechanism is the separate
+# TextDelimiterHex attribute, which takes plain hex digits as a quoted
+# string with no prefix (confirmed against a real working TPT example:
+# `TextDelimiterHex = '1F'`) - used INSTEAD OF TextDelimiter, not
+# alongside it.
+FIELD_DELIMITER = "\x1f"
+_TPT_TEXT_DELIMITER_HEX = "1F"
 
 
 @dataclass
@@ -94,7 +103,7 @@ DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
     VARCHAR DirectoryPath = @OutputDir,
     VARCHAR FileName = @OutputFile,
     VARCHAR Format = 'DELIMITED',
-    VARCHAR TextDelimiter = {_TPT_TEXT_DELIMITER_LITERAL},
+    VARCHAR TextDelimiterHex = '{_TPT_TEXT_DELIMITER_HEX}',
     VARCHAR OpenMode = 'Write',
     VARCHAR IndicatorMode = 'N'
   );
