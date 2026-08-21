@@ -154,18 +154,27 @@ def build_job_json(
                     # of corrupting row/field alignment downstream -
                     # confirmed live: a real column's embedded \r (not
                     # even \n) split one logical row into two fragments
-                    # when the export wasn't quoted. 34 is the ASCII code
-                    # for '"' - this reader's csvReaderConfig takes
-                    # character codes, not literal characters.
-                    # escapeMode is left at this reader's own default
-                    # (doubled-quote, "" -> one literal ") rather than
-                    # set explicitly here, since that's also TPT's own
-                    # default embedded-quote escaping - not guessing at
-                    # the right integer constant for an alternative mode
-                    # neither side actually needs.
+                    # when the export wasn't quoted.
+                    #
+                    # csvReaderConfig is applied via BeanUtils.populate()
+                    # directly onto the real com.csvreader.CsvReader
+                    # object (confirmed by disassembling the actual
+                    # deployed txtfilereader jar - not assumed from
+                    # generic docs), so every key here must exactly
+                    # match a real CsvReader JavaBean property, with a
+                    # value BeanUtils can coerce to that property's
+                    # actual type. setTextQualifier(char) takes a char -
+                    # BeanUtils' char conversion takes the FIRST
+                    # CHARACTER of the value's string form, so an
+                    # integer like 34 (meaning "ASCII code for the quote
+                    # character", the convention some DataX docs show)
+                    # becomes the literal character '3' instead - a real
+                    # bug hit live, silently causing every quote to go
+                    # unrecognized. The value must be the actual
+                    # one-character string '"' itself, not its ASCII code.
                     "csvReaderConfig": {
                         "useTextQualifier": True,
-                        "textQualifier": 34,
+                        "textQualifier": '"',
                         "safetySwitch": False,
                     },
                 },
