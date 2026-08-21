@@ -104,6 +104,38 @@ class PartitionRegistrar:
             logger.error(f"Failed to get Hive table count: {e}")
             return 0
 
+    def describe_table(self, schema: str, table: str) -> List[Tuple[str, str]]:
+        """Real Hive column order + type for schema.table, via DESCRIBE.
+        This is the authoritative order for anything writing Parquet into
+        this table - hdfswriter writes columns positionally, Hive reads
+        Parquet back positionally against its own DDL, so this (never a
+        legacy config's own column-list field, and never the source
+        table's own column order) is the one order that actually matters.
+
+        Stops at the first blank-name or `#`-prefixed row, which is where
+        Hive's DESCRIBE output for a partitioned table repeats every
+        partition column a second time under "# Partition Information" -
+        only the first (inline) listing is real physical write order. A
+        dynamic partition column still appears in that inline listing, in
+        its real position - Hive's dynamic-partition INSERT expects it
+        trailing the regular columns, not absent from them, and DataX
+        writes need to match that same shape."""
+        result = self._run_command(f"DESCRIBE {schema}.{table}", self.DESCRIBE_TIMEOUT)
+        columns: List[Tuple[str, str]] = []
+        for line in result.splitlines():
+            line = line.strip()
+            if not (line.startswith("|") and line.endswith("|")):
+                continue
+            parts = [p.strip() for p in line.strip("|").split("|")]
+            name = parts[0] if parts else ""
+            if name.lower() == "col_name":
+                continue  # header row
+            if not name or name.startswith("#"):
+                break  # blank separator or "# Partition Information" - real columns end here
+            dtype = parts[1] if len(parts) > 1 else ""
+            columns.append((name, dtype))
+        return columns
+
     def drop_table(self, schema: str, table: str) -> None:
         try:
             self._execute_query(
@@ -120,21 +152,30 @@ class PartitionRegistrar:
         location: str,
         file_format: str = "PARQUET",
         row_format_delimited_by: Optional[str] = None,
+        partition_columns: List[Tuple[str, str]] = (),
     ) -> None:
         """columns is [(name, hive_type), ...]. Set row_format_delimited_by
-        for TEXT format (e.g. '|'), leave None for PARQUET/ORC."""
+        for TEXT format (e.g. '|'), leave None for PARQUET/ORC.
+        `partition_columns` (also [(name, hive_type), ...], e.g.
+        [("processing_date", "STRING"), ("date_key", "STRING")]) adds a
+        PARTITIONED BY clause - needed for any table with a dynamic
+        partition column; omit for a flat table."""
         columns_def = ",\n".join(f"`{name}` {hive_type}" for name, hive_type in columns)
         row_format = ""
         if row_format_delimited_by:
             row_format = (
                 f"ROW FORMAT DELIMITED\nFIELDS TERMINATED BY '{row_format_delimited_by}'\n"
             )
+        partitioned_by = ""
+        if partition_columns:
+            partition_def = ", ".join(f"`{name}` {hive_type}" for name, hive_type in partition_columns)
+            partitioned_by = f"PARTITIONED BY ({partition_def})\n"
         create_query = f"""
             DROP TABLE IF EXISTS {schema}.{table} PURGE;
             CREATE EXTERNAL TABLE {schema}.{table} (
                 {columns_def}
             )
-            {row_format}STORED AS {file_format}
+            {partitioned_by}{row_format}STORED AS {file_format}
             LOCATION '{location}';
         """
         self._execute_query(create_query, f"create external table {table}")

@@ -24,8 +24,10 @@ from loguru import logger
 
 from .audit import CompositeAuditSink
 from .audit.jsonl_sink import JSONLFileAuditSink
-from .jobspec import JobSpec, load_jobs_dir, load_jobspec
+from .column_types import resolve_column_types, to_hive_type
+from .jobspec import JobSpec, TargetSpec, load_jobs_dir, load_jobspec
 from .job_runner import JobRunner, RunPaths, Unit, UnitResult
+from .obs_client import delete_prefix
 from .partition_registrar import PartitionRegistrar
 from .reader import ObsConfig
 from .retention import process_retention
@@ -346,6 +348,137 @@ def reconcile_cmd(
                 f"(source={record.source_row_count} target={record.target_row_count})")
     if record.status != "success":
         raise SystemExit(1)
+
+
+@cli.command("validate")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Draft job YAML - a table only belongs in jobs/ after this passes")
+@click.option("--processing-date", default=lambda: date.today().strftime("%Y-%m-%d"),
+              help="YYYY-MM-DD, defaults to today")
+@click.option("--row-limit", default=5000, help="Rows per unit for this scratch proof run")
+@click.option("--keep-scratch", is_flag=True,
+              help="Leave the scratch Hive table/OBS data in place for inspection instead of tearing it down")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+@click.option("--datax-home", default="", envvar="DATAX_HOME")
+@click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
+def validate_cmd(
+    job_path: Path, processing_date: str, row_limit: int, keep_scratch: bool,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str,
+):
+    """Prove a draft job spec actually works against real Teradata data
+    before it's trusted enough for jobs/: creates a scratch Hive table
+    matching the draft's real schema (via the same Teradata type
+    resolution a real run would do), loads --row-limit rows into it, and
+    reports whether DataX's own reported write count and an independent
+    Hive COUNT(*) agree.
+
+    Deliberately does NOT judge success via record.status - `verify()`
+    always compares target_row_count against the FULL unscoped source
+    table's count, which --row-limit can never match by design (it's a
+    scratch proof, not a full load); a dq_mismatch against
+    source_row_count here is expected, not a failure signal. The real
+    question this answers is narrower and more useful pre-promotion:
+    did every row DataX claims to have written actually land in Hive,
+    matching the schema this draft declares.
+
+    Tears the scratch Hive table + OBS data down afterward unless
+    --keep-scratch is passed."""
+    job = load_jobspec(job_path)
+    scratch_table = f"{job.target.hive_table}_TD2HIVE_VALIDATE"
+    scratch_obs_dir = f"/td2hive_validate/{job.table_name}"
+
+    conn = teradatasql.connect(host=td_host, user=td_user, password=td_password)
+    cursor = conn.cursor()
+    obs_config = ObsConfig(access_key=obs_access_key, secret_key=obs_secret_key, endpoint=obs_endpoint)
+    registrar = PartitionRegistrar()
+
+    dynamic_partition_cols = {p.column.lower() for p in job.target.partitions if p.dynamic}
+    resolved = resolve_column_types(cursor, job.source.owner, job.source.load_tables, job.source.columns)
+    data_columns = [
+        (name, to_hive_type(tpt_type))
+        for name, tpt_type, _ in resolved
+        if name.lower() not in dynamic_partition_cols
+    ]
+    partition_columns = [("processing_date", "STRING")] + [
+        (p.column, "STRING") for p in job.target.partitions if p.dynamic
+    ]
+
+    location = f"obs://{obs_bucket}{scratch_obs_dir}"
+    click.echo(f"Creating scratch table {job.target.hive_owner}.{scratch_table} at {location}")
+    registrar.create_external_table(
+        schema=job.target.hive_owner,
+        table=scratch_table,
+        columns=data_columns,
+        location=location,
+        file_format=job.target.format.upper(),
+        partition_columns=partition_columns,
+    )
+
+    scratch_job = JobSpec(
+        table_name=f"{job.table_name}__validate",
+        source=job.source,
+        target=TargetSpec(
+            hive_owner=job.target.hive_owner,
+            hive_table=scratch_table,
+            obs_dir=scratch_obs_dir,
+            format=job.target.format,
+            partitions=job.target.partitions,
+        ),
+        loader=job.loader,
+        setting=job.setting,
+    )
+
+    try:
+        audit_sink = CompositeAuditSink([JSONLFileAuditSink(Path(tpt_output_dir) / "_validate_audit.jsonl")])
+        run_id_dir = Path(tpt_output_dir) / scratch_job.table_name / processing_date
+        runner = JobRunner(
+            td_cursor=cursor, td_host=td_host, td_user=td_user, td_password=td_password,
+            obs_config=obs_config, obs_bucket=obs_bucket, audit_sink=audit_sink,
+            paths=RunPaths(
+                tpt_output_dir=run_id_dir / "tpt",
+                datax_logs_dir=Path(tpt_output_dir) / "_validate_datax_logs",
+                obs_buffer_dir="/data01/td2hive/tmp/obs",
+            ),
+            datax_home=datax_home,
+        )
+        record = runner.run(
+            scratch_job, date.fromisoformat(processing_date), row_limit=row_limit, force=True,
+        )
+        if record is None:
+            raise click.ClickException(
+                "scratch run reported already-succeeded, which force=True should have prevented - "
+                "this points at a bug in JobRunner.run(), not this draft"
+            )
+
+        click.echo(f"DataX reported: {record.datax_reported_count} row(s) written")
+        click.echo(f"Hive independently counted: {record.target_row_count} row(s)")
+        click.echo(
+            f"(status={record.status} against source_row_count={record.source_row_count} is expected to "
+            f"read dq_mismatch here - --row-limit={row_limit} deliberately doesn't export the whole "
+            f"source table - that disagreement is not what this command is judging.)"
+        )
+
+        if record.target_row_count > 0 and record.target_row_count == record.datax_reported_count:
+            click.echo(f"PASS: {job_path} is safe to promote into jobs/.")
+        else:
+            click.echo(
+                f"FAIL: DataX's reported write count and Hive's independent recount disagree "
+                f"({record.datax_reported_count} vs {record.target_row_count}) - do not promote this draft."
+            )
+            raise SystemExit(1)
+    finally:
+        if keep_scratch:
+            click.echo(
+                f"--keep-scratch passed: leaving {job.target.hive_owner}.{scratch_table} and "
+                f"{scratch_obs_dir} in place for inspection."
+            )
+        else:
+            registrar.drop_table(job.target.hive_owner, scratch_table)
+            deleted = delete_prefix(obs_config, obs_bucket, scratch_obs_dir.lstrip("/") + "/")
+            click.echo(f"Cleaned up scratch table and {deleted} OBS object(s) at {scratch_obs_dir}")
 
 
 @cli.group("retention")
