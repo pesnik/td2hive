@@ -278,6 +278,33 @@ retry-without-redoing-everything behavior for free from the
 orchestrator's own per-task retry, since each `run-unit` call is already
 atomic to one partition value.
 
+## Concurrency on a single host
+
+Running many tables off cron on one host has no built-in limit on how
+many DataX JVMs run at once - fine for a handful of tables, a real risk
+once dozens of tables' schedules start overlapping (each JVM can request
+a large heap; on a host with real memory headroom this is still worth
+bounding deliberately rather than trusting it never happens).
+`scripts/run_guarded.sh` wraps any command in a fixed pool of
+`flock`-based slots:
+
+```bash
+scripts/run_guarded.sh /path/to/python -m td2hive.cli run \
+  --job jobs/my_table.yaml --processing-date 2026-01-15 ...
+```
+
+An invocation past the slot pool **blocks** (polling every
+`TD2HIVE_LOCK_POLL_INTERVAL` seconds) until a slot frees, rather than
+failing or running unbounded - a cron job that fires while every slot is
+busy queues up and runs later. Configure via `TD2HIVE_CONCURRENCY_SLOTS`
+(default 6), `TD2HIVE_LOCK_DIR` (default `/var/lock/td2hive`). Point
+your cron entries at this wrapper instead of calling `td2hive`/`python
+-m td2hive.cli` directly.
+
+If you're on Kubernetes/Compose instead of cron, this isn't needed -
+your orchestrator's own resource requests/limits (or Compose's own
+container scheduling) already bound concurrency; see **Scaling** above.
+
 ## Retention
 
 ```bash
