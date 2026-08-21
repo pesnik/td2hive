@@ -90,16 +90,36 @@ You'll also need, on whatever host runs `td2hive run`:
 - **Docker**, with a `teradata/tpt` image available (Teradata's licensing
   means you build/obtain this image yourself).
 - **A DataX distribution** containing at minimum the `writer/hdfswriter`
-  and `reader/txtfilereader` plugins, built from
-  [alibaba/DataX](https://github.com/alibaba/DataX). Stock `hdfswriter`
-  bundles Hadoop 2.7.1 client jars, which throw
-  `NoSuchMethodError`/`NoClassDefFoundError` against most modern (3.x)
-  Hadoop clusters — you will very likely need to swap in jars matching
-  your own cluster's Hadoop version and object-store connector. See
-  `td2hive/datax/distribution.py` for a worked example against one real
-  Hadoop 3.3.1 + Huawei OBS deployment, and
-  `scripts/package_datax_dist.sh` / `scripts/deploy_datax_dist.sh` for
-  packaging and deploying whatever distribution you end up with.
+  and `reader/txtfilereader` plugins. Build one:
+
+  ```bash
+  # Requires Java 8 (DataX's own build doesn't work on newer JDKs) and Maven.
+  scripts/build_datax_dist.sh 3.3.6   # <- your cluster's Hadoop version
+  ```
+
+  This builds DataX from source at the commit pinned in
+  `vendor/DATAX_PINNED_COMMIT` (with the one patch DataX's own assembly
+  needs, `vendor/datax-patches/`), then resolves your Hadoop version's
+  client jars via Maven Central — replacing DataX's bundled Hadoop 2.7.1
+  jars, which throw `NoSuchMethodError`/`NoClassDefFoundError` against
+  most modern (3.x) clusters — and removes every jar the new set
+  supersedes. It finishes with a credential-free smoke test (writes
+  locally via `file://`, no cloud credentials needed) before declaring
+  success. Output lands at `build/datax-dist/datax`, ready for
+  `scripts/package_datax_dist.sh` / `scripts/deploy_datax_dist.sh`.
+
+  **Not resolved automatically:** your cloud/vendor object-store
+  connector jar (Huawei's `hadoop-huaweicloud`, AWS's `hadoop-aws`,
+  GCS's `gcs-connector`, etc.) — some vendors don't publish to public
+  Maven Central at all, so this can't be one-size-fits-all. If yours is
+  on Maven Central, pass its coordinates to `build_datax_dist.sh` /
+  `scripts/resolve_hadoop_jars.sh` as extra arguments (see that script's
+  header for the exact syntax); otherwise place the jar in
+  `build/datax-dist/datax/plugin/writer/hdfswriter/libs` yourself after
+  building. Then run `scripts/smoke_test_datax_dist.py` against your
+  *real* object storage before trusting the distribution with real data
+  — the build script's own smoke test only proves the Hadoop-jar swap
+  didn't break the classpath, not that your connector jar works.
 - **`beeline`**, for partition registration and verification queries.
 
 ## Quick start

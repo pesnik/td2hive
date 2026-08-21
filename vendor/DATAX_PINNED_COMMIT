@@ -1,0 +1,8 @@
+# The exact alibaba/DataX commit scripts/build_datax_dist.sh builds
+# against. Pinned, not "master", so a build today and a build next year
+# produce the same thing.
+#
+# To bump: update the SHA below, re-run scripts/build_datax_dist.sh for
+# every Hadoop version you care about, confirm the credential-free
+# smoke test at the end of that script still passes, then commit.
+80ec23d5c5328eb90ca364d2749e92dfaf44541e

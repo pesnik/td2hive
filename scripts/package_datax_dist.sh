@@ -2,10 +2,11 @@
 # Packages a locally-built DataX distribution into a versioned tarball
 # ready to ship. `datax-dist-dir` should contain core + the writer/reader
 # plugins you need (at minimum writer/hdfswriter and reader/txtfilereader)
-# - build it yourself from https://github.com/alibaba/DataX (or a fork),
-# with any Hadoop-client-jar swaps your own cluster needs (see
-# td2hive/datax/distribution.py's module docstring for why that's often
-# necessary, and a worked example for one real Hadoop/object-store combo).
+# - build one with `scripts/build_datax_dist.sh <hadoop-version>`, which
+# handles the source build and the Hadoop-client-jar swap your cluster
+# needs (see td2hive/datax/distribution.py's module docstring for why
+# that's necessary). Its output (build/datax-dist/datax) is exactly the
+# <datax-dist-dir> this script expects.
 #
 # Usage: scripts/package_datax_dist.sh <version> <datax-dist-dir>
 set -euo pipefail

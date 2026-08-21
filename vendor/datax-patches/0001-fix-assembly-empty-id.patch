@@ -1,0 +1,65 @@
+diff --git a/core/src/main/assembly/package.xml b/core/src/main/assembly/package.xml
+index 7369f56..52f1a7d 100755
+--- a/core/src/main/assembly/package.xml
++++ b/core/src/main/assembly/package.xml
+@@ -2,7 +2,7 @@
+         xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0 http://maven.apache.org/xsd/assembly-1.1.0.xsd">
+-    <id></id>
++    <id>dwzip</id>
+     <formats>
+         <format>dir</format>
+     </formats>
+diff --git a/hdfswriter/src/main/assembly/package.xml b/hdfswriter/src/main/assembly/package.xml
+index 0356c4a..5f5ec6c 100755
+--- a/hdfswriter/src/main/assembly/package.xml
++++ b/hdfswriter/src/main/assembly/package.xml
+@@ -2,7 +2,7 @@
+ 	xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0"
+ 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+ 	xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0 http://maven.apache.org/xsd/assembly-1.1.0.xsd">
+-	<id></id>
++	<id>dwzip</id>
+ 	<formats>
+ 		<format>dir</format>
+ 	</formats>
+diff --git a/streamreader/src/main/assembly/package.xml b/streamreader/src/main/assembly/package.xml
+index 5db1e0b..cc31cd6 100755
+--- a/streamreader/src/main/assembly/package.xml
++++ b/streamreader/src/main/assembly/package.xml
+@@ -2,7 +2,7 @@
+         xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0 http://maven.apache.org/xsd/assembly-1.1.0.xsd">
+-    <id></id>
++    <id>dwzip</id>
+     <formats>
+         <format>dir</format>
+     </formats>
+diff --git a/transformer/src/main/assembly/package.xml b/transformer/src/main/assembly/package.xml
+index 62fa7b0..db1097d 100755
+--- a/transformer/src/main/assembly/package.xml
++++ b/transformer/src/main/assembly/package.xml
+@@ -2,7 +2,7 @@
+         xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0 http://maven.apache.org/xsd/assembly-1.1.0.xsd">
+-    <id></id>
++    <id>dwzip</id>
+     <formats>
+         <format>dir</format>
+     </formats>
+diff --git a/txtfilereader/src/main/assembly/package.xml b/txtfilereader/src/main/assembly/package.xml
+index 895737b..119153d 100755
+--- a/txtfilereader/src/main/assembly/package.xml
++++ b/txtfilereader/src/main/assembly/package.xml
+@@ -2,7 +2,7 @@
+ 	xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0"
+ 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+ 	xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.0 http://maven.apache.org/xsd/assembly-1.1.0.xsd">
+-	<id></id>
++	<id>dwzip</id>
+ 	<formats>
+ 		<format>dir</format>
+ 	</formats>

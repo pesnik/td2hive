@@ -3,10 +3,21 @@
 against. Fails loudly on drift rather than letting a run silently use a
 distribution missing a jar it needs - stock DataX's `hdfswriter` bundles
 Hadoop 2.7.1 client jars, which throw NoSuchMethodError/NoClassDefFoundError
-against most modern (3.x) Hadoop clusters. You will very likely need to
-swap in jars matching your own cluster's Hadoop version and object-store
-connector (this package doesn't ship them - they're vendor/cluster-
-specific and not ours to redistribute).
+against most modern (3.x) Hadoop clusters.
+
+Build a distribution with `scripts/build_datax_dist.sh <hadoop-version>`
+rather than by hand - it builds DataX from a pinned source commit
+(vendor/DATAX_PINNED_COMMIT), then resolves your Hadoop version's generic
+client jars (hadoop-common, hadoop-hdfs, hadoop-hdfs-client,
+hadoop-annotations, hadoop-auth, plus known transitive fixes) via Maven
+Central (scripts/resolve_hadoop_jars.sh), removing every DataX-bundled
+jar the new set supersedes. Cloud/vendor object-store connector jars
+(Huawei's hadoop-huaweicloud, AWS's hadoop-aws, GCS's gcs-connector,
+etc.) are NOT resolved automatically by default - some vendors don't
+publish to public Maven Central at all, so this package can't assume one
+answer for everyone. If yours is on Maven Central, pass its coordinates
+as extra arguments to resolve_hadoop_jars.sh; otherwise it's a manual
+step (place the jar in hdfswriter/libs yourself).
 
 REQUIRED_HDFSWRITER_LIB_PREFIXES below is a validated example from one
 real deployment (Huawei MRS 3.3.1 + the Huawei OBS Hadoop connector) - a
