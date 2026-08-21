@@ -58,6 +58,18 @@ class ObsConfig:
 
 
 def _build_tpt_job_script(columns: List[ResolvedColumn], num_instances: int = 1) -> str:
+    # FILE_WRITER quotes every field (QuotedData='Yes', not just ones
+    # that need it) - simpler, unambiguous pairing with DataX's
+    # useTextQualifier reader config (see job_spec.py) than leaving TPT
+    # to decide per-field which ones need quoting. Preserves an embedded
+    # delimiter or CR/LF inside a VARCHAR value unchanged, instead of
+    # the data itself needing to change to survive export - confirmed
+    # live: a real column's embedded \r (not even \n) split one logical
+    # row into two fragments downstream when unquoted. (SQL-style '--'
+    # comments don't belong inside the generated script text itself -
+    # TPT's own job-script grammar doesn't accept them there, confirmed
+    # live via TPT02954 - hence this explanation lives here instead.)
+    #
     # Column names are double-quoted here - TPT's own job-script grammar
     # has a broader reserved-word set than Teradata SQL itself (found
     # live: a real column named NAME - not reserved in SQL - failed
@@ -104,14 +116,6 @@ DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
     VARCHAR FileName = @OutputFile,
     VARCHAR Format = 'DELIMITED',
     VARCHAR TextDelimiterHex = '{_TPT_TEXT_DELIMITER_HEX}',
-    -- Every field quoted (not just ones that need it) - simpler,
-    -- unambiguous pairing with DataX's useTextQualifier reader config
-    -- (see job_spec.py) than leaving TPT to decide per-field which
-    -- ones need quoting. Preserves an embedded delimiter or CR/LF
-    -- inside a VARCHAR value unchanged, instead of the data itself
-    -- needing to change to survive export - confirmed live 2026-08-22:
-    -- a real column's embedded \r (not even \n) split one logical row
-    -- into two fragments downstream when unquoted.
     VARCHAR QuotedData = 'Yes',
     VARCHAR OpenQuoteMark = '"',
     VARCHAR CloseQuoteMark = '"',
