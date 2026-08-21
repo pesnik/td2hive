@@ -38,14 +38,27 @@ class AuditRecord:
 
 
 class AuditSink(Protocol):
+    # Declared False by a sink that can't look records back up (e.g. a
+    # write-only lineage emitter or alerting sink) - checked at
+    # CompositeAuditSink construction time, not by calling find_success()
+    # and catching NotImplementedError (that would mean actually running
+    # a real lookup - a DB round-trip for SQLAuditSink - just to validate
+    # config, a real side effect a config-time check shouldn't have).
+    # Defaults to True via getattr() for any sink that doesn't declare
+    # it, so existing sinks (JSONLFileAuditSink/SQLAuditSink) don't need
+    # to opt in explicitly - they're lookup-capable, which was already
+    # the implicit assumption.
+    supports_lookup: bool
+
     def record(self, run: AuditRecord) -> None: ...
 
     def find_success(self, job_name: str, processing_date: str) -> bool:
         """Used for idempotency: has this (job, date) already succeeded?
         Sinks that can't look records back up (e.g. a write-only lineage
-        emitter) should raise NotImplementedError - CompositeAuditSink
-        requires at least one lookup-capable sink, enforced at config-load
-        time, so a real answer is always available."""
+        emitter) should raise NotImplementedError AND set
+        supports_lookup = False - CompositeAuditSink requires at least
+        one lookup-capable sink, enforced at config-load time, so a real
+        answer is always available."""
         ...
 
 
@@ -65,11 +78,7 @@ class CompositeAuditSink:
 
     @staticmethod
     def _supports_lookup(sink: AuditSink) -> bool:
-        try:
-            sink.find_success.__func__ is not None  # type: ignore
-            return True
-        except AttributeError:
-            return False
+        return getattr(sink, "supports_lookup", True)
 
     def record(self, run: AuditRecord) -> None:
         from loguru import logger

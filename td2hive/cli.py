@@ -23,6 +23,7 @@ import teradatasql
 from loguru import logger
 
 from .audit import CompositeAuditSink
+from .audit.alerting_sink import AlertingAuditSink, AlertingConfig
 from .audit.jsonl_sink import JSONLFileAuditSink
 from .column_types import resolve_column_types, to_hive_type
 from .jobspec import JobSpec, TargetSpec, load_jobs_dir, load_jobspec
@@ -42,6 +43,19 @@ _OBS_OPTS = [
     click.option("--obs-secret-key", required=True, envvar="OBS_SECRET_KEY"),
     click.option("--obs-endpoint", required=True, envvar="OBS_ENDPOINT"),
     click.option("--obs-bucket", required=True, envvar="OBS_BUCKET"),
+]
+# All optional, all off by default - alerting is opt-in like every other
+# credential-bearing sink in this package (see AlertingConfig's own
+# docstring). Only wired in when --alert-sms-gateway-url and
+# --alert-recipients are both set.
+_ALERT_OPTS = [
+    click.option("--alert-sms-gateway-url", default="", envvar="ALERT_SMS_GATEWAY_URL",
+                 help="SMS gateway base URL - alerting stays disabled if unset"),
+    click.option("--alert-sms-username", default="", envvar="ALERT_SMS_USERNAME"),
+    click.option("--alert-sms-password", default="", envvar="ALERT_SMS_PASSWORD"),
+    click.option("--alert-sms-from", default="", envvar="ALERT_SMS_FROM"),
+    click.option("--alert-recipients", default="", envvar="ALERT_RECIPIENTS",
+                 help="Comma-separated phone numbers to alert on any non-success run"),
 ]
 
 
@@ -70,6 +84,7 @@ def cli():
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="", help="SQLAlchemy URL, e.g. mysql+pymysql://...")
+@_apply_options(_ALERT_OPTS)
 def run_one(
     job_path: Path,
     processing_date: str,
@@ -86,6 +101,8 @@ def run_one(
     tpt_output_dir: str,
     audit_jsonl: str,
     audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """Run one table's job spec for one processing date."""
     job = load_jobspec(job_path)
@@ -93,6 +110,7 @@ def run_one(
         job, processing_date, row_limit, force, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     if record is None:
         click.echo(f"{job.table_name}/{processing_date}: skipped (already succeeded)")
@@ -113,6 +131,7 @@ def run_one(
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="")
+@_apply_options(_ALERT_OPTS)
 def run_all(
     jobs_dir: Path,
     processing_date: str,
@@ -128,6 +147,8 @@ def run_all(
     tpt_output_dir: str,
     audit_jsonl: str,
     audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """Run every DataX-loader job spec under jobs-dir for one processing date."""
     jobs = [j for j in load_jobs_dir(jobs_dir) if j.uses_datax]
@@ -138,6 +159,7 @@ def run_all(
                 job, processing_date, 0, force, td_host, td_user, td_password,
                 obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
                 datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+                alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
             )
             if record is None:
                 click.echo(f"{job.table_name}: skipped (already succeeded)")
@@ -158,6 +180,8 @@ def _build_runner(
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ) -> JobRunner:
     """Shared connection/runner setup for every run/plan/run-unit/reconcile
     command below. Constructing a JobRunner never touches DataX itself
@@ -172,6 +196,20 @@ def _build_runner(
     if audit_sql_url:
         from .audit.sql_sink import SQLAuditSink
         sinks.append(SQLAuditSink(audit_sql_url))
+    # Opt-in, like every other credential-bearing sink here: only wired
+    # in when both a gateway URL and at least one recipient are set.
+    # Fires on any non-success run.
+    recipients = [r.strip() for r in alert_recipients.split(",") if r.strip()]
+    if alert_sms_gateway_url and recipients:
+        sinks.append(AlertingAuditSink(
+            AlertingConfig(
+                gateway_url=alert_sms_gateway_url,
+                username=alert_sms_username,
+                password=alert_sms_password,
+                from_number=alert_sms_from,
+            ),
+            recipients=recipients,
+        ))
     audit_sink = CompositeAuditSink(sinks)
 
     run_id_dir = Path(tpt_output_dir) / job.table_name / processing_date
@@ -197,11 +235,14 @@ def _run_job(
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     runner = _build_runner(
         job, processing_date, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     return runner.run(
         job, date.fromisoformat(processing_date), row_limit=row_limit, force=force
@@ -224,11 +265,14 @@ def _run_job(
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="")
+@_apply_options(_ALERT_OPTS)
 def plan_cmd(
     job_path: Path, processing_date: str,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """List this job's units as JSON - one line per unit, to stdout. Feed
     into `run-unit --unit <line>` (once per line, anywhere) or an
@@ -239,6 +283,7 @@ def plan_cmd(
         job, processing_date, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     units = runner.plan(job, date.fromisoformat(processing_date))
     for unit in units:
@@ -254,11 +299,14 @@ def plan_cmd(
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="")
+@_apply_options(_ALERT_OPTS)
 def prepare_cmd(
     job_path: Path, processing_date: str,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """Clear every unit's target OBS path once, before any run-unit call.
     Must run exactly once, before fan-out begins - see JobRunner.prepare's
@@ -268,6 +316,7 @@ def prepare_cmd(
         job, processing_date, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     units = runner.plan(job, date.fromisoformat(processing_date))
     runner.prepare(units)
@@ -287,11 +336,14 @@ def prepare_cmd(
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="")
+@_apply_options(_ALERT_OPTS)
 def run_unit_cmd(
     job_path: Path, processing_date: str, unit_json: str, row_limit: int, result_file: Path,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """Run exactly one unit (TPT export + DataX write + partition
     registration) - the thing a k8s Job pod / Airflow mapped task / Argo
@@ -303,6 +355,7 @@ def run_unit_cmd(
         job, processing_date, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     unit = Unit.from_dict(json.loads(unit_json))
     result = runner.run_unit(job, unit, row_limit=row_limit)
@@ -323,11 +376,14 @@ def run_unit_cmd(
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 @click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
 @click.option("--audit-sql-url", default="")
+@_apply_options(_ALERT_OPTS)
 def reconcile_cmd(
     job_path: Path, processing_date: str, results_dir: Path,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+    alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
+    alert_sms_from: str, alert_recipients: str,
 ):
     """Once every unit's run-unit has completed: register every
     partition, verify() the whole job once, write the one AuditRecord.
@@ -338,6 +394,7 @@ def reconcile_cmd(
         job, processing_date, td_host, td_user, td_password,
         obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
         datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+        alert_sms_gateway_url, alert_sms_username, alert_sms_password, alert_sms_from, alert_recipients,
     )
     result_files = sorted(results_dir.glob("*.json"))
     if not result_files:
