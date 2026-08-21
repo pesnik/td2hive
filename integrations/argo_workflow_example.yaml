@@ -1,0 +1,115 @@
+# Argo Workflows maps almost exactly onto plan/run-unit/reconcile:
+# `withParam` fanning out over plan's JSON array, an `onExit` handler
+# running reconcile() regardless of whether every run-unit step
+# succeeded (verify()'s independent count is the honest signal either
+# way - see reconcile()'s docstring). This is the natural fit among the
+# three integration examples (compose, k8s raw Jobs, this) since Argo's
+# whole model is already "run this container N times from a dynamic
+# list, then run one more after."
+#
+# Requires: a ReadWriteMany PVC (td2hive-plan, same requirement as
+# k8s/plan-job.yaml - see that file for why), td2hive-credentials Secret
+# (k8s/secret.example.yaml), a datax-dist PVC populated with a built
+# DataX distribution.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: td2hive-example-fact-table-
+spec:
+  entrypoint: main
+  onExit: reconcile
+  arguments:
+    parameters:
+      - name: job-name
+        value: example_fact_table
+      - name: processing-date
+        value: "2026-01-15"
+  volumes:
+    - name: plan
+      persistentVolumeClaim:
+        claimName: td2hive-plan
+    - name: datax-dist
+      persistentVolumeClaim:
+        claimName: td2hive-datax-dist
+
+  templates:
+    - name: main
+      steps:
+        - - name: plan
+            template: plan-step
+        - - name: prepare
+            template: prepare-step
+        - - name: run-units
+            template: run-unit-step
+            arguments:
+              parameters:
+                - name: unit
+                  value: "{{item}}"
+            withParam: "{{steps.plan.outputs.result}}"
+
+    - name: plan-step
+      script:
+        image: td2hive-tpt:latest
+        command: [sh]
+        source: |
+          set -eu
+          td2hive plan \
+            --job=/app/jobs/{{workflow.parameters.job-name}}.yaml \
+            --processing-date={{workflow.parameters.processing-date}} \
+          | python3 -c "import sys, json; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))"
+        envFrom:
+          - secretRef: { name: td2hive-credentials }
+
+    - name: prepare-step
+      # Must run once, after plan and before any run-unit step - see
+      # JobRunner.prepare()'s docstring for why this can't be pushed into
+      # each fanned-out run-unit call instead.
+      container:
+        image: td2hive-tpt:latest
+        command: [td2hive]
+        args:
+          - prepare
+          - --job=/app/jobs/{{workflow.parameters.job-name}}.yaml
+          - --processing-date={{workflow.parameters.processing-date}}
+        envFrom:
+          - secretRef: { name: td2hive-credentials }
+
+    - name: run-unit-step
+      inputs:
+        parameters:
+          - name: unit
+      container:
+        image: td2hive-tpt:latest
+        command: [sh, -c]
+        args:
+          - >-
+            mkdir -p /plan/results &&
+            td2hive run-unit
+            --job=/app/jobs/{{workflow.parameters.job-name}}.yaml
+            --processing-date={{workflow.parameters.processing-date}}
+            --unit='{{inputs.parameters.unit}}'
+            --datax-home=/data01/td2hive/datax/current
+            --result-file="/plan/results/$(mktemp -u XXXXXXXX).json"
+        envFrom:
+          - secretRef: { name: td2hive-credentials }
+        volumeMounts:
+          - name: plan
+            mountPath: /plan
+          - name: datax-dist
+            mountPath: /data01/td2hive/datax/current
+            readOnly: true
+
+    - name: reconcile
+      container:
+        image: td2hive-tpt:latest
+        command: [td2hive]
+        args:
+          - reconcile
+          - --job=/app/jobs/{{workflow.parameters.job-name}}.yaml
+          - --processing-date={{workflow.parameters.processing-date}}
+          - --results-dir=/plan/results
+        envFrom:
+          - secretRef: { name: td2hive-credentials }
+        volumeMounts:
+          - name: plan
+            mountPath: /plan

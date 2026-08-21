@@ -1,0 +1,41 @@
+# The simple case: one table, run daily, no fan-out needed - `td2hive
+# run` does plan/prepare/run_units(batched)/reconcile itself, in one pod,
+# same as it would on any single host. Reach for k8s/run-all.sh +
+# plan-job.yaml/run-units-job.yaml/reconcile-job.yaml only once a single
+# table's partition count genuinely makes sequential-in-one-pod too slow.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: td2hive-example-fact-table
+spec:
+  schedule: "0 2 * * *" # 02:00 daily - adjust to your own SLA
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: td2hive
+              image: td2hive-tpt:latest
+              # `command`+`args` don't go through a shell, so $(...) date
+              # substitution needs one explicitly - `td2hive` itself is
+              # still what actually runs, just invoked via sh -c.
+              command: ["sh", "-c"]
+              args:
+                - >-
+                  td2hive run
+                  --job=/app/jobs/example_fact_table.yaml
+                  --processing-date=$(date -u -d yesterday +%Y-%m-%d)
+                  --datax-home=/data01/td2hive/datax/current
+              envFrom:
+                - secretRef:
+                    name: td2hive-credentials
+              volumeMounts:
+                - name: datax-dist
+                  mountPath: /data01/td2hive/datax/current
+                  readOnly: true
+          volumes:
+            - name: datax-dist
+              persistentVolumeClaim:
+                claimName: td2hive-datax-dist

@@ -59,6 +59,16 @@ class RunSetting:
     # sole idempotency mechanism; hdfswriter must never also try to manage
     # conflicts in the same directory (double-cleanup/race risk).
     write_mode: str = "append"
+    # Caps how many partition values' DataX writes job_runner.run_units()
+    # groups into one job.json (one shared JVM/channel pool), by summed
+    # channel count. DataX's own JVM cold-start is a real fixed cost per
+    # invocation - without batching, a table with hundreds of dynamic
+    # partition values means hundreds of JVM launches for the sequential
+    # single-process `run` path. Only applies there; `run-unit` (the
+    # externally-parallelizable primitive for k8s/Airflow/Argo) always
+    # does exactly one partition value per JVM by design, since batching
+    # across pods/containers would defeat the point of distributing them.
+    max_channels_per_job: int = 64
 
 
 @dataclass
@@ -113,6 +123,7 @@ def load_jobspec(path: Path) -> JobSpec:
         ),
         speed_channel=setting_raw.get("speed_channel", 1),
         write_mode=setting_raw.get("write_mode", "append"),
+        max_channels_per_job=setting_raw.get("max_channels_per_job", 64),
     )
 
     return JobSpec(

@@ -7,3 +7,4 @@ dist/
 venv/
 .env
 *.log
+k8s/secret.yaml

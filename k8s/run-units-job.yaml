@@ -1,0 +1,57 @@
+# Step 2: fans out one pod per unit td2hive-plan enumerated, using k8s
+# 1.24+'s Indexed completion mode - each pod gets JOB_COMPLETION_INDEX
+# set automatically, used here to pick that pod's own line out of
+# units.jsonl and to name its result file uniquely. ${PARALLELISM} and
+# ${COMPLETIONS} are filled in by k8s/run-all.sh from td2hive-plan's own
+# unit count (only known after that job runs - plain k8s Jobs can't
+# express "however many units plan() finds" statically).
+#
+# Uses the td2hive-tpt image (see docker/Dockerfile.td2hive-tpt) - this
+# is exactly the scenario that image exists for: a pod running `tbuild`
+# needs to do so without a Docker daemon, which a k8s pod doesn't have
+# access to safely by default.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: td2hive-run-units
+spec:
+  completionMode: Indexed
+  parallelism: ${PARALLELISM}
+  completions: ${COMPLETIONS}
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run-unit
+          image: td2hive-tpt:latest
+          command: ["sh", "-c"]
+          args:
+            - >-
+              UNIT=$(sed -n "$((JOB_COMPLETION_INDEX + 1))p" /plan/units.jsonl) &&
+              mkdir -p /plan/results &&
+              td2hive run-unit
+              --job /app/jobs/${JOB_NAME}.yaml
+              --processing-date ${PROCESSING_DATE}
+              --unit "$UNIT"
+              --result-file /plan/results/unit-${JOB_COMPLETION_INDEX}.json
+              --datax-home /data01/td2hive/datax/current
+          envFrom:
+            - secretRef:
+                name: td2hive-credentials
+          volumeMounts:
+            - name: plan
+              mountPath: /plan
+            - name: datax-dist
+              mountPath: /data01/td2hive/datax/current
+              readOnly: true
+      volumes:
+        - name: plan
+          persistentVolumeClaim:
+            claimName: td2hive-plan
+        - name: datax-dist
+          persistentVolumeClaim:
+            claimName: td2hive-datax-dist # populate via an initContainer using the
+                                           # td2hive-datax image, or any volume
+                                           # your cluster already provisions
+                                           # DATAX_HOME from

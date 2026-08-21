@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""td2hive CLI. Two command groups: `run`/`run-all` for loading, and
+"""td2hive CLI. Two main command groups: `run`/`run-all` for loading, and
 `retention` for expiring old partitions - deliberately separate, since
 retention runs on its own schedule (e.g. weekly) independent of loading
 (e.g. daily), and should never be folded into a load run automatically.
+
+`plan`/`prepare`/`run-unit`/`reconcile` are the lower-level primitives
+`run` is built from - exposed on their own so an external scheduler
+(a k8s Job with parallelism>1, an Airflow mapped task, an Argo Workflow
+step) can fan a job's units out across processes/containers instead of
+running them sequentially inside one `td2hive run` invocation. Most
+users just want `run`/`run-all` - reach for the primitives only when
+actually distributing a job's units across more than one worker.
 """
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
@@ -16,7 +25,7 @@ from loguru import logger
 from .audit import CompositeAuditSink
 from .audit.jsonl_sink import JSONLFileAuditSink
 from .jobspec import JobSpec, load_jobs_dir, load_jobspec
-from .job_runner import JobRunner, RunPaths
+from .job_runner import JobRunner, RunPaths, Unit, UnitResult
 from .partition_registrar import PartitionRegistrar
 from .reader import ObsConfig
 from .retention import process_retention
@@ -142,12 +151,17 @@ def run_all(
         raise SystemExit(1)
 
 
-def _run_job(
-    job: JobSpec, processing_date: str, row_limit: int, force: bool,
+def _build_runner(
+    job: JobSpec, processing_date: str,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
-):
+) -> JobRunner:
+    """Shared connection/runner setup for every run/plan/run-unit/reconcile
+    command below. Constructing a JobRunner never touches DataX itself
+    (see JobRunner.runner's lazy property) - only actually running a unit
+    does, so `plan`/`reconcile` work fine even without a DataX
+    distribution available where they run."""
     conn = teradatasql.connect(host=td_host, user=td_user, password=td_password)
     cursor = conn.cursor()
     obs_config = ObsConfig(access_key=obs_access_key, secret_key=obs_secret_key, endpoint=obs_endpoint)
@@ -159,7 +173,7 @@ def _run_job(
     audit_sink = CompositeAuditSink(sinks)
 
     run_id_dir = Path(tpt_output_dir) / job.table_name / processing_date
-    runner = JobRunner(
+    return JobRunner(
         td_cursor=cursor, td_host=td_host, td_user=td_user, td_password=td_password,
         obs_config=obs_config, obs_bucket=obs_bucket, audit_sink=audit_sink,
         paths=RunPaths(
@@ -168,9 +182,164 @@ def _run_job(
         ),
         datax_home=datax_home,
     )
+
+
+def _run_job(
+    job: JobSpec, processing_date: str, row_limit: int, force: bool,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+):
+    runner = _build_runner(
+        job, processing_date, td_host, td_user, td_password,
+        obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
+        datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+    )
     return runner.run(
         job, date.fromisoformat(processing_date), row_limit=row_limit, force=force
     )
+
+
+# ---------------------------------------------------------------------
+# plan / prepare / run-unit / reconcile - the primitives `run` is built
+# from, exposed for external fan-out (k8s Job parallelism, Airflow
+# dynamic task mapping, Argo Workflow withParam steps). See module
+# docstring; most users want `run`/`run-all` instead.
+# ---------------------------------------------------------------------
+
+@cli.command("plan")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--processing-date", required=True, help="YYYY-MM-DD")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+@click.option("--datax-home", default="", envvar="DATAX_HOME")
+@click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
+@click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
+@click.option("--audit-sql-url", default="")
+def plan_cmd(
+    job_path: Path, processing_date: str,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+):
+    """List this job's units as JSON - one line per unit, to stdout. Feed
+    into `run-unit --unit <line>` (once per line, anywhere) or an
+    orchestrator's native fan-out (k8s Job parallelism, Airflow
+    .expand(), Argo withParam)."""
+    job = load_jobspec(job_path)
+    runner = _build_runner(
+        job, processing_date, td_host, td_user, td_password,
+        obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
+        datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+    )
+    units = runner.plan(job, date.fromisoformat(processing_date))
+    for unit in units:
+        click.echo(json.dumps(unit.to_dict()))
+
+
+@cli.command("prepare")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--processing-date", required=True, help="YYYY-MM-DD")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+@click.option("--datax-home", default="", envvar="DATAX_HOME")
+@click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
+@click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
+@click.option("--audit-sql-url", default="")
+def prepare_cmd(
+    job_path: Path, processing_date: str,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+):
+    """Clear every unit's target OBS path once, before any run-unit call.
+    Must run exactly once, before fan-out begins - see JobRunner.prepare's
+    docstring for why this can't be pushed into each unit's own run."""
+    job = load_jobspec(job_path)
+    runner = _build_runner(
+        job, processing_date, td_host, td_user, td_password,
+        obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
+        datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+    )
+    units = runner.plan(job, date.fromisoformat(processing_date))
+    runner.prepare(units)
+    click.echo(f"{job.table_name}/{processing_date}: prepared {len(units)} unit(s)")
+
+
+@cli.command("run-unit")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--processing-date", required=True, help="YYYY-MM-DD")
+@click.option("--unit", "unit_json", required=True, help="One line of `td2hive plan`'s output")
+@click.option("--row-limit", default=0, help="Cap exported rows (scratch/proof runs only)")
+@click.option("--result-file", default="", type=click.Path(path_type=Path),
+              help="Write this unit's result JSON here, for `reconcile --results-dir` to read back")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+@click.option("--datax-home", default="", envvar="DATAX_HOME")
+@click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
+@click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
+@click.option("--audit-sql-url", default="")
+def run_unit_cmd(
+    job_path: Path, processing_date: str, unit_json: str, row_limit: int, result_file: Path,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+):
+    """Run exactly one unit (TPT export + DataX write + partition
+    registration) - the thing a k8s Job pod / Airflow mapped task / Argo
+    step actually runs. Requires `prepare` to have already run for this
+    job/date. Does NOT verify or write an AuditRecord - call `reconcile`
+    once every unit's run-unit has completed."""
+    job = load_jobspec(job_path)
+    runner = _build_runner(
+        job, processing_date, td_host, td_user, td_password,
+        obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
+        datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+    )
+    unit = Unit.from_dict(json.loads(unit_json))
+    result = runner.run_unit(job, unit, row_limit=row_limit)
+    click.echo(json.dumps(result.to_dict()))
+    if result_file:
+        result_file.parent.mkdir(parents=True, exist_ok=True)
+        result_file.write_text(json.dumps(result.to_dict()))
+
+
+@cli.command("reconcile")
+@click.option("--job", "job_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--processing-date", required=True, help="YYYY-MM-DD")
+@click.option("--results-dir", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Directory of result JSON files written by `run-unit --result-file`")
+@_apply_options(_TD_OPTS)
+@_apply_options(_OBS_OPTS)
+@click.option("--datax-home", default="", envvar="DATAX_HOME")
+@click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
+@click.option("--audit-jsonl", default="/data01/td2hive/logs/audit.jsonl")
+@click.option("--audit-sql-url", default="")
+def reconcile_cmd(
+    job_path: Path, processing_date: str, results_dir: Path,
+    td_host: str, td_user: str, td_password: str,
+    obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
+    datax_home: str, tpt_output_dir: str, audit_jsonl: str, audit_sql_url: str,
+):
+    """Once every unit's run-unit has completed: register every
+    partition, verify() the whole job once, write the one AuditRecord.
+    This is the ONLY step that decides success/dq_mismatch - never any
+    individual run-unit call."""
+    job = load_jobspec(job_path)
+    runner = _build_runner(
+        job, processing_date, td_host, td_user, td_password,
+        obs_access_key, obs_secret_key, obs_endpoint, obs_bucket,
+        datax_home, tpt_output_dir, audit_jsonl, audit_sql_url,
+    )
+    result_files = sorted(results_dir.glob("*.json"))
+    if not result_files:
+        raise click.ClickException(f"No unit result files found under {results_dir}")
+    unit_results = [UnitResult.from_dict(json.loads(f.read_text())) for f in result_files]
+    record = runner.reconcile(job, date.fromisoformat(processing_date), unit_results)
+    click.echo(f"{job.table_name}/{processing_date}: {record.status} "
+                f"(source={record.source_row_count} target={record.target_row_count})")
+    if record.status != "success":
+        raise SystemExit(1)
 
 
 @cli.group("retention")

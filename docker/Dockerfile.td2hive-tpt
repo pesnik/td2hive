@@ -1,0 +1,44 @@
+# Kubernetes-friendly td2hive image: the Teradata TPT client is baked in
+# directly (FROM teradata/tpt), so TPTExporter runs `tbuild` as a plain
+# local subprocess (auto-detected via `shutil.which("tbuild")` - see
+# reader.py) instead of spawning a sibling `teradata/tpt` Docker
+# container. This removes the Docker-in-Docker dependency the default
+# image (Dockerfile.td2hive) has:
+#   - a k8s pod spawning `docker run` needs either a privileged DinD
+#     sidecar or the host node's /var/run/docker.sock mounted in, both
+#     of which most managed clusters restrict for good security reasons,
+#     and both of which are real operational cost even where allowed.
+#   - with tbuild already part of this image, none of that is needed -
+#     td2hive's own container just runs it directly, the same way it
+#     already runs `beeline` as a plain subprocess.
+#
+# Requires you already have (or can build) a `teradata/tpt` image -
+# Teradata's own licensing means this package doesn't redistribute it
+# (same constraint the default image's Docker-mode already has). Adjust
+# the FROM line to your own registry/tag if you don't publish it as
+# `teradata/tpt:latest`.
+ARG TPT_BASE_IMAGE=teradata/tpt:latest
+FROM ${TPT_BASE_IMAGE}
+
+USER root
+# python3 for td2hive itself; a JRE for DataX's own `datax.py` wrapper to
+# exec `java` into (DataX's classes are Java-8-bytecode but run fine on a
+# newer JRE - only the build needs JDK 8 exactly, see
+# scripts/build_datax_dist.sh). Package manager varies by base image -
+# teradata/tpt's own base isn't fixed across versions/vendors.
+RUN (apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip openjdk-17-jre-headless \
+     && rm -rf /var/lib/apt/lists/*) \
+    || (yum install -y python3 python3-pip java-17-openjdk-headless && yum clean all)
+
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY td2hive/ ./td2hive/
+RUN pip3 install --no-cache-dir .
+
+# teradata/tpt's own entrypoint/env setup (accept_license, tdwallet,
+# ttuuser) is specific to how that image is normally run standalone via
+# `docker run` - inherited here since we build FROM it, but td2hive's own
+# CLI is what a pod actually runs day to day.
+ENTRYPOINT ["td2hive"]
+CMD ["--help"]

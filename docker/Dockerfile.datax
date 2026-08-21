@@ -1,0 +1,42 @@
+# Builds a DataX distribution image from source using
+# scripts/build_datax_dist.sh (see that script and
+# td2hive/datax/distribution.py for why this can't just be `pip install`
+# - DataX is a separate Java project this package drives as a
+# subprocess, not a Python dependency). Multi-stage: build with Maven +
+# JDK 8 (what DataX's own build requires), ship with a slim JRE 8 -
+# nothing Maven/JDK-specific ends up in the final image.
+#
+# Build args:
+#   HADOOP_VERSION - your cluster's Hadoop client version (default 3.3.6,
+#                    the version this session validated against - see
+#                    scripts/resolve_hadoop_jars.sh)
+#   EXTRA_MAVEN_COORDS - space-separated groupId:artifactId:version triples
+#                    for your object-store connector, if it's on Maven
+#                    Central (e.g. AWS S3's hadoop-aws) - see
+#                    scripts/resolve_hadoop_jars.sh's header for details.
+#                    Leave empty and add the jar yourself (COPY it in
+#                    below, or into a running container's
+#                    plugin/writer/hdfswriter/libs/) if your connector
+#                    (e.g. Huawei's OBS) isn't Maven-Central-hosted.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.datax --build-arg HADOOP_VERSION=3.3.6 -t td2hive-datax:3.3.6 .
+
+FROM maven:3.8.8-eclipse-temurin-8 AS build
+ARG HADOOP_VERSION=3.3.6
+ARG EXTRA_MAVEN_COORDS=""
+WORKDIR /build
+COPY vendor/ ./vendor/
+COPY scripts/build_datax_dist.sh scripts/resolve_hadoop_jars.sh ./scripts/
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN ./scripts/build_datax_dist.sh "${HADOOP_VERSION}" /build/dist \
+    && if [ -n "${EXTRA_MAVEN_COORDS}" ]; then \
+         ./scripts/resolve_hadoop_jars.sh "${HADOOP_VERSION}" \
+           /build/dist/datax/plugin/writer/hdfswriter/libs ${EXTRA_MAVEN_COORDS}; \
+       fi
+
+FROM eclipse-temurin:8-jre-jammy
+WORKDIR /data01/td2hive/datax
+COPY --from=build /build/dist/datax ./current
+ENV DATAX_HOME=/data01/td2hive/datax/current

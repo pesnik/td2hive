@@ -1,0 +1,48 @@
+# Step 1 of the fan-out sequence (see k8s/run-all.sh for the full glue):
+# runs `td2hive plan`, writes one JSON unit per line to a shared PVC so
+# run-units-job.yaml's indexed pods can each read their own line by
+# JOB_COMPLETION_INDEX. Requires a ReadWriteMany-capable StorageClass
+# (NFS, EFS, Filestore, etc. depending on your cluster) - a real,
+# concrete requirement worth calling out, not hidden in a comment
+# elsewhere: plain k8s has no built-in way to hand data between separate
+# Job objects other than shared storage or the Kubernetes API itself.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: td2hive-plan
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: td2hive-plan
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: plan
+          image: td2hive-tpt:latest # or td2hive:latest - plan() never touches TPT/DataX
+          command: ["sh", "-c"]
+          args:
+            - >-
+              td2hive plan
+              --job /app/jobs/${JOB_NAME}.yaml
+              --processing-date ${PROCESSING_DATE}
+              > /plan/units.jsonl
+              && wc -l < /plan/units.jsonl > /plan/unit-count
+          envFrom:
+            - secretRef:
+                name: td2hive-credentials
+          volumeMounts:
+            - name: plan
+              mountPath: /plan
+      volumes:
+        - name: plan
+          persistentVolumeClaim:
+            claimName: td2hive-plan

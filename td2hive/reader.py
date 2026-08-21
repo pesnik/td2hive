@@ -8,6 +8,7 @@ Teradata at volume. Relocated unchanged from tpt_export.py.
 """
 
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -105,11 +106,27 @@ def build_select_stmt(
 
 
 class TPTExporter:
-    """Runs a TPT export inside the teradata/tpt Docker image on this host.
+    """Runs a TPT export via `tbuild`, either directly as a local
+    subprocess (if `tbuild` is already on PATH - true when this process's
+    own container image is built `FROM teradata/tpt` rather than the
+    default python-only image, see docker/Dockerfile.td2hive-tpt) or by
+    spawning a sibling `teradata/tpt` Docker container (the original,
+    still-default mode - requires access to the Docker daemon, either a
+    real host or a mounted docker.sock).
 
-    Requires Docker and the teradata/tpt image to already be present on the
-    execution host - this does not pull the image (production hosts are
-    typically network-restricted; pull it once via
+    The local-subprocess mode exists specifically to remove the Docker-
+    in-Docker dependency in a Kubernetes context: `docker run` from
+    inside a k8s pod means either a privileged DinD sidecar or mounting
+    the host node's docker.sock (usually disallowed on managed clusters
+    for good reason), neither of which is needed if `tbuild` itself is
+    just part of the pod's own image. Auto-detected via `shutil.which`,
+    not configured - whichever the image actually provides is the one
+    used, with no separate flag to keep in sync with how the image was
+    built.
+
+    Docker mode requires Docker and the teradata/tpt image to already be
+    present on the execution host - this does not pull the image
+    (production hosts are typically network-restricted; pull it once via
     `docker save teradata/tpt | ssh host docker load` from a host with
     internet access, see tpt/README or the deployment notes).
     """
@@ -123,9 +140,11 @@ class TPTExporter:
         self.td_password = td_password
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Container's internal user (ttuuser, uid 1001) isn't the host user
-        # this runs as - needs write access to land the exported CSV here.
+        # Docker mode's container's internal user (ttuuser, uid 1001) isn't
+        # the host user this runs as - needs write access to land the
+        # exported CSV here regardless of which mode ends up used.
         self.output_dir.chmod(0o777)
+        self._local_tbuild = shutil.which("tbuild")
 
     def export(
         self,
@@ -146,7 +165,62 @@ class TPTExporter:
         base_name = f"{table.lower()}{'_' + file_label if file_label else ''}.csv"
         job_script = _build_tpt_job_script(columns, num_instances)
         select_stmt = build_select_stmt(schema, table, columns, row_limit, where_clause)
+        job_name = f"export_{table.lower()}_{int(time.time())}"
+        cyclic_flag = ["-C"] if num_instances > 1 else []
 
+        if self._local_tbuild:
+            self._export_via_local_tbuild(
+                schema, table, base_name, job_script, select_stmt, job_name, cyclic_flag
+            )
+        else:
+            self._export_via_docker(
+                schema, table, base_name, job_script, select_stmt, job_name, cyclic_flag
+            )
+
+        if num_instances <= 1:
+            return [self.output_dir / base_name]
+        return [self.output_dir / f"{base_name}-{i}" for i in range(1, num_instances + 1)]
+
+    def _export_via_local_tbuild(
+        self, schema, table, base_name, job_script, select_stmt, job_name, cyclic_flag
+    ) -> None:
+        """Runs tbuild directly - no container boundary, so OutputDir is
+        this process's own real output_dir path, not a mounted /tpt_output.
+        Blocks until tbuild exits (no polling needed, unlike Docker mode:
+        a plain subprocess naturally blocks for its own lifetime, it
+        doesn't detach the way `docker run -d` does)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            script_file = tmp_path / "export.tpt"
+            script_file.write_text(job_script)
+            jobvars_file = tmp_path / "jobvars.txt"
+            jobvars_file.write_text(
+                f"TdpId='{self.td_host}'\n"
+                f"UserName='{self.td_user}'\n"
+                f"UserPassword='{self.td_password}'\n"
+                f"SelectStmt='{select_stmt}'\n"
+                f"OutputDir='{self.output_dir}'\n"
+                f"OutputFile='{base_name}'\n"
+            )
+            cmd = [
+                self._local_tbuild, "-f", str(script_file), "-j", job_name,
+                *cyclic_flag, "-v", str(jobvars_file),
+            ]
+            logger.info(f"Starting local tbuild for {schema}.{table}")
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=self.TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"TPT export timed out after {self.TIMEOUT_SECONDS}s for {schema}.{table}"
+                )
+            logs = result.stdout + result.stderr
+            self._check_tbuild_output(logs, schema, table)
+
+    def _export_via_docker(
+        self, schema, table, base_name, job_script, select_stmt, job_name, cyclic_flag
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             # tempfile.TemporaryDirectory() defaults to 0o700 (owner-only) -
@@ -171,8 +245,6 @@ class TPTExporter:
             # user that wrote this file - needs to be world-readable.
             jobvars_file.chmod(0o644)
 
-            job_name = f"export_{table.lower()}_{int(time.time())}"
-            cyclic_flag = ["-C"] if num_instances > 1 else []
             cmd = [
                 "docker", "run", "-d",
                 "-e", "accept_license=Y",
@@ -206,9 +278,29 @@ class TPTExporter:
                     capture_output=True, timeout=60,
                 )
 
-        if num_instances <= 1:
-            return [self.output_dir / base_name]
-        return [self.output_dir / f"{base_name}-{i}" for i in range(1, num_instances + 1)]
+    @staticmethod
+    def _is_tbuild_failure(logs: str) -> bool:
+        """"Job terminated with status N." (N != 0) is tbuild's own
+        generic failure marker - broader than the two specific substrings
+        this used to check for, which missed at least one real failure
+        (TPT04187 malformed jobvars.txt, confirmed 2026-08-20) and would
+        have spun for the full timeout instead of failing fast. Shared by
+        both the local-subprocess and Docker paths so they can't drift."""
+        return bool(
+            "terminated (status" in logs
+            or "compilation failed" in logs
+            or re.search(r"Job terminated with status [1-9]", logs)
+        )
+
+    def _check_tbuild_output(self, logs: str, schema: str, table: str) -> None:
+        """Local mode has no "still running" ambiguity the way Docker
+        mode's polling does - subprocess.run already blocked until tbuild
+        fully exited, so anything other than the success marker is a
+        failure, known-pattern or not."""
+        if "completed successfully" in logs:
+            logger.info(f"TPT export completed for {schema}.{table}")
+            return
+        raise RuntimeError(f"TPT export failed for {schema}.{table}: {logs[-2000:]}")
 
     def _wait_for_completion(
         self, container_id: str, schema: str, table: str, poll_interval: int = 15
@@ -226,17 +318,7 @@ class TPTExporter:
             if "completed successfully" in logs:
                 logger.info(f"TPT export completed for {schema}.{table}")
                 return
-            # "Job terminated with status N." (N != 0) is tbuild's own
-            # generic failure marker - broader than the two specific
-            # substrings this used to check for, which missed at least
-            # one real failure (TPT04187 malformed jobvars.txt, confirmed
-            # 2026-08-20) and would have spun for the full timeout instead
-            # of failing fast.
-            if (
-                "terminated (status" in logs
-                or "compilation failed" in logs
-                or re.search(r"Job terminated with status [1-9]", logs)
-            ):
+            if self._is_tbuild_failure(logs):
                 raise RuntimeError(
                     f"TPT export failed for {schema}.{table}: {logs[-2000:]}"
                 )

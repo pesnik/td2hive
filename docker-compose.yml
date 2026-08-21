@@ -1,0 +1,88 @@
+# Example: running td2hive on a single host with just Docker - no k8s,
+# no external orchestrator. Demonstrates the easy scaling win (multiple
+# *different* jobs running concurrently, each its own container) rather
+# than distributing one job's units across workers (see k8s/job.yaml for
+# that - single-host Docker Compose doesn't have a native indexed-fan-out
+# primitive the way k8s's Job does).
+#
+# `datax-dist` builds once and populates a shared named volume other
+# services mount read-only - Compose has no built-in init-container
+# concept, so a one-shot "copy then exit" service plus
+# `depends_on: condition: service_completed_successfully` is the
+# standard workaround.
+#
+# The default td2hive image's TPTExporter spawns a sibling
+# `teradata/tpt` container via the Docker CLI (see reader.py) - that
+# needs the host's docker.sock mounted in, which is fine for a
+# single-host Compose setup (all containers already share that host) but
+# is exactly what Dockerfile.td2hive-tpt exists to avoid for Kubernetes.
+#
+# Usage:
+#   cp .env.example .env   # fill in real TD_*/OBS_* values
+#   docker compose up
+
+services:
+  datax-dist:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.datax
+      args:
+        HADOOP_VERSION: "3.3.6"
+    image: td2hive-datax:3.3.6
+    volumes:
+      - datax-dist:/shared
+    entrypoint: ["sh", "-c", "cp -r /data01/td2hive/datax/current/. /shared/ && echo 'DataX distribution ready'"]
+
+  # One example job. Add more services following this same shape (one
+  # per job you want running concurrently) - Compose starts every
+  # service without an explicit `depends_on` gate at the same time, so
+  # N job services here means N jobs genuinely running in parallel, each
+  # in its own container.
+  example-dim-table:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.td2hive
+    image: td2hive:latest
+    depends_on:
+      datax-dist:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      - DATAX_HOME=/data01/td2hive/datax/current
+    volumes:
+      - datax-dist:/data01/td2hive/datax/current:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./td2hive/jobs:/app/jobs:ro
+      - tpt-output:/data01/td2hive/tpt_output
+      - logs:/data01/td2hive/logs
+    command:
+      - run
+      - --job=/app/jobs/example_dim_table.yaml
+      - --processing-date=2026-01-15
+
+  example-fact-table:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.td2hive
+    image: td2hive:latest
+    depends_on:
+      datax-dist:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      - DATAX_HOME=/data01/td2hive/datax/current
+    volumes:
+      - datax-dist:/data01/td2hive/datax/current:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./td2hive/jobs:/app/jobs:ro
+      - tpt-output:/data01/td2hive/tpt_output
+      - logs:/data01/td2hive/logs
+    command:
+      - run
+      - --job=/app/jobs/example_fact_table.yaml
+      - --processing-date=2026-01-15
+
+volumes:
+  datax-dist:
+  tpt-output:
+  logs:

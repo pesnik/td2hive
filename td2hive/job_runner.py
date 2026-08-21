@@ -1,25 +1,47 @@
 #!/usr/bin/env python3
-"""Thin coordinator: export (TPT, directly split by partition value and
-directly chunked into parallel files) -> build job.json -> run DataX
-(fast-fail check only) -> register partition -> verify (the real verdict)
--> audit. No business logic of its own - every step below is a call into
-a module that owns that logic and can be tested/reused on its own. Kept
-intentionally small so this file doesn't become the next 1700-line
-orchestrator.
+"""Coordinator, split into independently-invokable phases so a job's units
+of work can be distributed across processes/containers (k8s Jobs, Airflow
+mapped tasks, Argo Workflow steps) instead of only ever running inside one
+sequential Python process:
+
+    plan()      -> list every distinct (load_table, partition_value) unit,
+                   read-only, no side effects. Queries Teradata only.
+    prepare()   -> clear every unit's target OBS path exactly once (must
+                   run once, before any unit writes - see its docstring
+                   for why this can't safely be pushed into run_unit()).
+    run_unit()  -> do exactly ONE unit's TPT export + DataX write +
+                   partition registration. The atomic, externally-
+                   parallelizable primitive - this is what a k8s Job pod /
+                   Airflow mapped task / Argo step calls.
+    run_units() -> the same work as N run_unit() calls, but batches
+                   multiple units' DataX writes into fewer job.json calls
+                   (shared JVM/channel pool) - a real, measured cost
+                   (DataX's JVM cold-start) that matters once a table has
+                   many partition values and everything's running
+                   sequentially in one process. NOT used by run_unit()
+                   itself - batching across pods/containers would defeat
+                   the point of distributing them.
+    reconcile() -> after every unit's result is in, register every
+                   partition, verify() the whole job once, write the one
+                   AuditRecord.
+    run()       -> the single-container default: plan -> prepare ->
+                   run_units (batched) -> reconcile, all in-process. This
+                   is `td2hive run`, unchanged in outward behavior from
+                   before this split - every step it does was already
+                   here, just no longer only reachable as one function.
 """
 
-import shutil
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
 from .audit import AuditRecord
-from .column_types import resolve_column_types
+from .column_types import ResolvedColumn, resolve_column_types
 from .datax.distribution import resolve_datax_home, validate_distribution
-from .datax.job_spec import build_job_json
+from .datax.job_spec import ContentSpec, build_job_json
 from .datax.runner import DataxRunner
 from .jobspec import JobSpec
 from .partition_registrar import PartitionRegistrar, PartitionSpec
@@ -32,6 +54,67 @@ from .verify import verify
 class RunPaths:
     tpt_output_dir: Path
     datax_logs_dir: Path
+
+
+@dataclass
+class Unit:
+    """One distinct (load_table, partition_value) piece of work - the
+    thing `plan()` enumerates and `run_unit()` executes. A table with no
+    dynamic partition column has exactly one Unit per load_table (empty
+    partition_values, no WHERE filter - matches the whole table)."""
+
+    load_table: str
+    partition_values: Dict[str, str]
+    where_clause: str
+    file_label: str
+    target_path: str
+
+    def to_dict(self) -> dict:
+        return {
+            "load_table": self.load_table,
+            "partition_values": self.partition_values,
+            "where_clause": self.where_clause,
+            "file_label": self.file_label,
+            "target_path": self.target_path,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "Unit":
+        return Unit(
+            load_table=d["load_table"],
+            partition_values=d["partition_values"],
+            where_clause=d["where_clause"],
+            file_label=d["file_label"],
+            target_path=d["target_path"],
+        )
+
+
+@dataclass
+class UnitResult:
+    """What `run_unit()`/`run_units()` hands to `reconcile()` - either
+    in-process (the default `run()` path) or via a small JSON result file
+    a separate `run-unit` invocation writes to disk, for a caller (a k8s
+    Job's exit step, an Airflow downstream task, an Argo exit handler) to
+    collect before calling `reconcile()`."""
+
+    unit: Unit
+    records_read: int = 0
+    records_failed: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "unit": self.unit.to_dict(),
+            "records_read": self.records_read,
+            "records_failed": self.records_failed,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "UnitResult":
+        return UnitResult(
+            unit=Unit.from_dict(d["unit"]),
+            records_read=d["records_read"],
+            records_failed=d["records_failed"],
+        )
 
 
 class JobRunner:
@@ -54,158 +137,51 @@ class JobRunner:
         self.audit_sink = audit_sink
         self.paths = paths
         self.registrar = PartitionRegistrar()
-        self.datax_home = resolve_datax_home(datax_home or "")
-        validate_distribution(self.datax_home)
-        self.runner = DataxRunner(self.datax_home)
+        self._datax_home_arg = datax_home or ""
+        self._runner: Optional[DataxRunner] = None
 
-    def run(
-        self, job: JobSpec, processing_date: date, row_limit: int = 0, force: bool = False
-    ) -> Optional[AuditRecord]:
-        start_time = datetime.now()
+    @property
+    def runner(self) -> DataxRunner:
+        """Lazy: resolving/validating DATAX_HOME is only meaningful for
+        the methods that actually invoke DataX (_run_batch, via
+        run_unit/run_units/run) - plan() and reconcile() never touch it,
+        so a `td2hive plan` step (e.g. a k8s Job's init step, computing
+        the fan-out before any worker pod exists) shouldn't need a DataX
+        distribution mounted at all just to construct a JobRunner."""
+        if self._runner is None:
+            datax_home = resolve_datax_home(self._datax_home_arg)
+            validate_distribution(datax_home)
+            self._runner = DataxRunner(datax_home)
+        return self._runner
+
+    # ------------------------------------------------------------------
+    # plan
+    # ------------------------------------------------------------------
+
+    def plan(self, job: JobSpec, processing_date: date) -> List[Unit]:
+        """Enumerate every unit this job needs, for every load table.
+        Read-only: queries Teradata (SELECT DISTINCT on dynamic partition
+        columns) but touches nothing on OBS/Hive. Safe to call repeatedly
+        for inspection (`td2hive plan`) without side effects."""
         date_str = processing_date.strftime("%Y-%m-%d")
-
-        if not force and self.audit_sink.find_success(job.table_name, date_str):
-            logger.info(f"{job.table_name}/{date_str} already succeeded, skipping (use force=True to re-run)")
-            return None
-
+        dynamic_cols = [p.column for p in job.target.partitions if p.dynamic]
         columns = resolve_column_types(
             self.td_cursor, job.source.owner, job.source.load_tables, job.source.columns
         )
-
-        dynamic_cols = [p.column for p in job.target.partitions if p.dynamic]
-        # Also doubles as TPT's export-instance count (reader.TPTExporter's
-        # num_instances) - one knob for "how parallel should this table's
-        # load be," not two. TPT's DataConnector writes directly into this
-        # many files, round-robin distributed (tbuild -C), so DataX's
-        # channel count naturally matches (see build_job_json) - no local
-        # CSV read/rewrite pass needed for either partitioning or
-        # chunking. Validated 2026-08-20 against 2M real rows: exact file
-        # count, near-even distribution, 0 rows lost.
-        num_instances = max(1, job.setting.speed_channel)
-        datax_records_read = 0
-        datax_records_failed = 0
-        # Every distinct partition_values combination actually written -
-        # registered explicitly via ADD PARTITION below, never via MSCK
-        # REPAIR's directory-tree auto-discovery. We already know every
-        # value up front (queried directly, see below), so there is
-        # nothing for MSCK to discover that we don't already have - and
-        # MSCK REPAIR was found 2026-08-20 to fail unreliably against this
-        # OBS backend for DataX-written directories (generic DDLTask
-        # error, no usable server-side detail from the client), while
-        # explicit ADD PARTITION against the identical data succeeded and
-        # read back an exact row-count match.
-        registered_partitions: dict = {}
-        # Cleared once per unique target_path per run, not once per
-        # load_table: multiple source load tables can land rows in the
-        # SAME partition directory (e.g. two load tables both contributing
-        # DATE_KEY=X rows to one table). Deleting on every load_table's
-        # write would wipe out an earlier load_table's just-written data
-        # in the same run. This delete-then-write is the sole idempotency
-        # mechanism for this loader - hdfswriter's own writeMode stays
-        # 'append' (see jobspec.RunSetting) precisely so it never also
-        # tries to manage conflicts in the same directory.
-        cleared_paths: set = set()
-
+        units: List[Unit] = []
         for load_table in job.source.load_tables:
             for partition_values, where_clause, file_label in self._partition_value_scopes(
                 job, load_table, dynamic_cols, columns
             ):
-                csv_paths = self.tpt_exporter.export(
-                    job.source.owner,
-                    load_table,
-                    columns,
-                    row_limit,
-                    where_clause=where_clause,
-                    num_instances=num_instances,
-                    file_label=file_label,
-                )
-
                 target_path = self._build_target_path(job, date_str, partition_values)
-                if target_path not in cleared_paths:
-                    deleted = delete_prefix(
-                        self.obs_config, self.obs_bucket, target_path.lstrip("/") + "/"
-                    )
-                    if deleted:
-                        logger.info(f"Cleared {deleted} existing object(s) at {target_path} before writing")
-                    cleared_paths.add(target_path)
-                ensure_prefix_exists(self.obs_config, self.obs_bucket, target_path)
-                job_json = build_job_json(
-                    local_csv_paths=csv_paths,
-                    columns=columns,
-                    target_obs_path=f"obs://{self.obs_bucket}{target_path}",
-                    file_name=job.target.hive_table.lower(),
-                    file_type=job.target.format,
-                    field_delimiter="|",
-                    setting=job.setting,
-                    obs_config=self.obs_config,
-                    exclude_columns=dynamic_cols,
-                )
-                run_dir = (
-                    self.paths.datax_logs_dir
-                    / job.table_name
-                    / date_str
-                    / load_table
-                    / (file_label or "_")
-                )
-                result = self.runner.run(job_json, run_dir)
-                if not result.succeeded or not result.within_error_limit(
-                    job.setting.error_limit.record
-                ):
-                    raise RuntimeError(
-                        f"DataX run failed for {job.table_name}/{load_table}: "
-                        f"see {result.log_path} (never display raw - may contain credentials)"
-                    )
-                datax_records_read += result.records_read or 0
-                datax_records_failed += result.records_failed or 0
-                registered_partitions[tuple(sorted(partition_values.items()))] = target_path
-
-        for partition_values, target_path in registered_partitions.items():
-            spec = PartitionSpec(values={"processing_date": date_str, **dict(partition_values)})
-            self.registrar.add_partition(
-                job.target.hive_owner,
-                job.target.hive_table,
-                spec.to_sql(),
-                f"obs://{self.obs_bucket}{target_path}",
-            )
-
-        result = verify(
-            self.td_cursor,
-            job.source.owner,
-            job.source.load_tables,
-            job.target.hive_owner,
-            job.target.hive_table,
-            hive_where=f'processing_date="{date_str}"',
-            registrar=self.registrar,
-        )
-
-        record = AuditRecord(
-            job_name=job.table_name,
-            processing_date=date_str,
-            source_schema=job.source.owner,
-            source_table=",".join(job.source.load_tables),
-            hive_schema=job.target.hive_owner,
-            hive_table=job.target.hive_table,
-            source_row_count=result.source_count,
-            target_row_count=result.target_count,
-            status=result.status,
-            loader="datax",
-            datax_reported_count=datax_records_read,
-            start_time=start_time,
-            end_time=datetime.now(),
-        )
-        self.audit_sink.record(record)
-
-        # Local TPT-exported CSVs serve no further purpose once verify()
-        # independently confirms the data landed in OBS - leaving them on
-        # disk is pure waste, and at real production scale it's not a
-        # small amount: a single day's run for one large table left 169GB
-        # of exported+split CSVs sitting untouched (confirmed 2026-08-20).
-        # Kept on failure/mismatch deliberately, for debugging - only a
-        # confirmed-successful run's local files are safe to delete.
-        if result.status == "success":
-            shutil.rmtree(self.tpt_exporter.output_dir, ignore_errors=True)
-
-        return record
+                units.append(Unit(
+                    load_table=load_table,
+                    partition_values=partition_values,
+                    where_clause=where_clause,
+                    file_label=file_label,
+                    target_path=target_path,
+                ))
+        return units
 
     def _partition_value_scopes(self, job: JobSpec, load_table: str, dynamic_cols: list, columns: list):
         """Yields (partition_values, where_clause, file_label) once per
@@ -256,3 +232,245 @@ class JobRunner:
         for column, value in partition_values.items():
             path += f"/{column}={value}"
         return path
+
+    # ------------------------------------------------------------------
+    # prepare
+    # ------------------------------------------------------------------
+
+    def prepare(self, units: List[Unit]) -> None:
+        """Clear every unit's target OBS path exactly once before any
+        unit writes. Must run as a single, one-time step ahead of the
+        whole fan-out - NOT something each run_unit() can safely do for
+        itself: multiple units (e.g. two load tables both contributing
+        rows to the same DATE_KEY partition) can share one target_path,
+        and if units run concurrently across pods/containers, whichever
+        one "clears first" racing against another that already started
+        writing would wipe out real data. Deleting every unique path up
+        front, before fan-out begins, removes that race entirely. This
+        delete-then-write is the sole idempotency mechanism for this
+        loader - hdfswriter's own writeMode stays 'append' (see
+        jobspec.RunSetting) precisely so it never also tries to manage
+        conflicts in the same directory."""
+        cleared_paths: set = set()
+        for unit in units:
+            if unit.target_path in cleared_paths:
+                continue
+            deleted = delete_prefix(
+                self.obs_config, self.obs_bucket, unit.target_path.lstrip("/") + "/"
+            )
+            if deleted:
+                logger.info(f"Cleared {deleted} existing object(s) at {unit.target_path} before writing")
+            ensure_prefix_exists(self.obs_config, self.obs_bucket, unit.target_path)
+            cleared_paths.add(unit.target_path)
+
+    # ------------------------------------------------------------------
+    # run_unit / run_units
+    # ------------------------------------------------------------------
+
+    def run_unit(self, job: JobSpec, unit: Unit, row_limit: int = 0) -> UnitResult:
+        """Do exactly one unit's TPT export + DataX write + partition
+        registration. Always one partition value, one job.json (one
+        content block), one DataX JVM launch - this is the primitive a
+        k8s Job pod / Airflow mapped task / Argo step calls, so it must
+        stay independently runnable with nothing but the job spec and
+        this one unit (columns are re-resolved here, not threaded through
+        from plan() - a cheap DBC.ColumnsV metadata query, not worth
+        coupling a distributed worker to plan()'s process). `row_limit`
+        is for scratch/proof runs only (TOP N)."""
+        columns = resolve_column_types(
+            self.td_cursor, job.source.owner, job.source.load_tables, job.source.columns
+        )
+        results = self._run_batch(job, [unit], columns, row_limit=row_limit)
+        return results[0]
+
+    def run_units(self, job: JobSpec, units: List[Unit], row_limit: int = 0) -> List[UnitResult]:
+        """Same work as calling run_unit() once per unit, but groups
+        multiple units' DataX writes into as few job.json calls as fit
+        under job.setting.max_channels_per_job - each batch shares one
+        JVM instead of paying a fresh cold-start per partition value.
+        Used by the sequential single-container run() path; never used
+        by run_unit() itself (batching across externally-scheduled
+        pods/containers would defeat the point of distributing them)."""
+        columns = resolve_column_types(
+            self.td_cursor, job.source.owner, job.source.load_tables, job.source.columns
+        )
+        num_instances = max(1, job.setting.speed_channel)
+        budget = max(1, job.setting.max_channels_per_job)
+
+        results: List[UnitResult] = []
+        batch: List[Unit] = []
+        batch_channels = 0
+        for unit in units:
+            if batch and batch_channels + num_instances > budget:
+                results.extend(self._run_batch(job, batch, columns, row_limit=row_limit))
+                batch, batch_channels = [], 0
+            batch.append(unit)
+            batch_channels += num_instances
+        if batch:
+            results.extend(self._run_batch(job, batch, columns, row_limit=row_limit))
+        return results
+
+    def _run_batch(
+        self, job: JobSpec, units: List[Unit], columns: List[ResolvedColumn], row_limit: int = 0
+    ) -> List[UnitResult]:
+        """Runs one or more units as ONE DataX job.json (one JVM, one
+        content block per unit). TPT export stays one call per unit
+        regardless - FILE_WRITER[n]/tbuild -C round-robins rows across n
+        files, it doesn't route by column value into a named file, so a
+        combined multi-value TPT export can't produce per-value output
+        without a local re-split (the exact double-I/O this pipeline's
+        redesign eliminated - see reader.py)."""
+        num_instances = max(1, job.setting.speed_channel)
+
+        content_specs = []
+        unit_csv_paths: List[List[Path]] = []
+        for unit in units:
+            csv_paths = self.tpt_exporter.export(
+                job.source.owner,
+                unit.load_table,
+                columns,
+                row_limit=row_limit,
+                where_clause=unit.where_clause,
+                num_instances=num_instances,
+                file_label=unit.file_label,
+            )
+            unit_csv_paths.append(csv_paths)
+            content_specs.append(ContentSpec(
+                local_csv_paths=csv_paths,
+                target_obs_path=f"obs://{self.obs_bucket}{unit.target_path}",
+                file_name=job.target.hive_table.lower(),
+                exclude_columns=list(unit.partition_values.keys()),
+            ))
+
+        job_json = build_job_json(
+            content_specs=content_specs,
+            columns=columns,
+            file_type=job.target.format,
+            field_delimiter="|",
+            setting=job.setting,
+            obs_config=self.obs_config,
+        )
+        run_dir = (
+            self.paths.datax_logs_dir / job.table_name
+            / "_".join(u.file_label or u.load_table for u in units)
+        )
+        result = self.runner.run(job_json, run_dir)
+        if not result.succeeded or not result.within_error_limit(job.setting.error_limit.record):
+            raise RuntimeError(
+                f"DataX run failed for {job.table_name} ({len(units)} unit(s)): "
+                f"see {result.log_path} (never display raw - may contain credentials)"
+            )
+
+        # DataX's own report is the fast-fail signal only (see runner.py) -
+        # split evenly across this batch's units for telemetry, since
+        # DataX itself doesn't report per-content-block counts. The real
+        # verdict is reconcile()'s independent verify(), against the whole
+        # job, not any individual unit or batch.
+        per_unit_read = (result.records_read or 0) // len(units)
+        per_unit_failed = (result.records_failed or 0) // len(units)
+
+        # Local TPT-exported CSVs serve no further purpose once this
+        # batch's DataX run reports success - deleted here (gated only on
+        # DataX's fast-fail signal, not the whole job's later independent
+        # verify()) because a unit run via run_unit() may execute in a
+        # container with no access to disk any later reconcile() step
+        # runs on. Real production scale: a single day's run for one
+        # large table left 169GB of exported CSVs sitting untouched
+        # before this cleanup existed at all (confirmed 2026-08-20).
+        for csv_paths in unit_csv_paths:
+            for p in csv_paths:
+                p.unlink(missing_ok=True)
+
+        return [
+            UnitResult(unit=u, records_read=per_unit_read, records_failed=per_unit_failed)
+            for u in units
+        ]
+
+    # ------------------------------------------------------------------
+    # reconcile
+    # ------------------------------------------------------------------
+
+    def reconcile(
+        self,
+        job: JobSpec,
+        processing_date: date,
+        unit_results: List[UnitResult],
+        start_time: Optional[datetime] = None,
+    ) -> AuditRecord:
+        """After every unit's result is in: register every distinct
+        partition explicitly (never MSCK REPAIR's directory-tree auto-
+        discovery - every partition value is already known, queried up
+        front in plan(), so there's nothing for MSCK to discover that
+        isn't already known, and MSCK REPAIR was found 2026-08-20 to fail
+        unreliably against this OBS backend for DataX-written
+        directories), verify() the whole job once against independent
+        Teradata/Hive counts, and write the one AuditRecord."""
+        date_str = processing_date.strftime("%Y-%m-%d")
+        datax_records_read = sum(r.records_read for r in unit_results)
+
+        registered_partitions: dict = {}
+        for result in unit_results:
+            key = tuple(sorted(result.unit.partition_values.items()))
+            registered_partitions[key] = result.unit.target_path
+
+        for partition_values, target_path in registered_partitions.items():
+            spec = PartitionSpec(values={"processing_date": date_str, **dict(partition_values)})
+            self.registrar.add_partition(
+                job.target.hive_owner,
+                job.target.hive_table,
+                spec.to_sql(),
+                f"obs://{self.obs_bucket}{target_path}",
+            )
+
+        result = verify(
+            self.td_cursor,
+            job.source.owner,
+            job.source.load_tables,
+            job.target.hive_owner,
+            job.target.hive_table,
+            hive_where=f'processing_date="{date_str}"',
+            registrar=self.registrar,
+        )
+
+        record = AuditRecord(
+            job_name=job.table_name,
+            processing_date=date_str,
+            source_schema=job.source.owner,
+            source_table=",".join(job.source.load_tables),
+            hive_schema=job.target.hive_owner,
+            hive_table=job.target.hive_table,
+            source_row_count=result.source_count,
+            target_row_count=result.target_count,
+            status=result.status,
+            loader="datax",
+            datax_reported_count=datax_records_read,
+            start_time=start_time or datetime.now(),
+            end_time=datetime.now(),
+        )
+        self.audit_sink.record(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # run - the single-container default, unchanged in outward behavior
+    # ------------------------------------------------------------------
+
+    def run(
+        self, job: JobSpec, processing_date: date, row_limit: int = 0, force: bool = False
+    ) -> Optional[AuditRecord]:
+        """plan -> prepare -> run_units (batched) -> reconcile, all
+        in-process. This is `td2hive run` - every external behavior
+        (idempotency check, final AuditRecord, success/dq_mismatch
+        semantics) is exactly what it was before this file was split
+        into phases; only the internal shape changed. `row_limit` is for
+        scratch/proof runs only (TOP N per unit)."""
+        start_time = datetime.now()
+        date_str = processing_date.strftime("%Y-%m-%d")
+
+        if not force and self.audit_sink.find_success(job.table_name, date_str):
+            logger.info(f"{job.table_name}/{date_str} already succeeded, skipping (use force=True to re-run)")
+            return None
+
+        units = self.plan(job, processing_date)
+        self.prepare(units)
+        unit_results = self.run_units(job, units, row_limit=row_limit)
+        return self.reconcile(job, processing_date, unit_results, start_time=start_time)

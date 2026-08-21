@@ -1,0 +1,32 @@
+# Default td2hive runtime image: Python package only, no Teradata TPT
+# client bundled - TPTExporter falls back to spawning a sibling
+# `teradata/tpt` container via the Docker CLI (see reader.py), which
+# means this image needs access to a Docker daemon at runtime (either
+# the host's, via a mounted /var/run/docker.sock - see docker-compose.yml
+# - or none at all if you're not exporting via TPT in this container).
+#
+# For Kubernetes, prefer Dockerfile.td2hive-tpt instead: it bakes the
+# Teradata TPT client in directly (FROM teradata/tpt), so `tbuild` runs
+# as a plain subprocess with no Docker-in-Docker dependency at all - see
+# that file's own header for why nested/sibling containers are a poor
+# fit for most k8s clusters (docker.sock is usually restricted, and a
+# privileged DinD sidecar is its own real security cost).
+FROM python:3.11-slim
+
+# docker-cli (talks to a mounted /var/run/docker.sock as a client - see
+# docker-compose.yml) + a JRE for DataX's own `datax.py` wrapper to exec
+# `java` into. DataX's classes are compiled for Java 8 bytecode (its
+# build needs JDK 8 specifically - see scripts/build_datax_dist.sh) but
+# that bytecode runs fine on a newer JRE; no need to match JDK 8 exactly
+# at runtime, unlike at build time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        docker.io openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY td2hive/ ./td2hive/
+RUN pip install --no-cache-dir .
+
+ENTRYPOINT ["td2hive"]
+CMD ["--help"]

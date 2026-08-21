@@ -172,6 +172,61 @@ You'll also need, on whatever host runs `td2hive run`:
    the result. `status` is `success` or `dq_mismatch`, decided entirely
    by the independent count comparison in `verify.py`.
 
+## Scaling: one job across many workers
+
+`td2hive run` does everything sequentially in one process/container -
+fine for most tables, but a table with hundreds of dynamic partition
+values benefits from spreading the work out. Two separate mechanisms,
+solving two separate costs:
+
+- **DataX JVM cold-start** (real, measured cost per invocation) is fixed
+  by `run()` itself: `job.setting.max_channels_per_job` (default 64)
+  groups multiple partition values' writes into as few `job.json` calls
+  (shared JVM/channel pool) as fit the budget, instead of one JVM launch
+  per partition value. No configuration needed to benefit from this -
+  it's what `run`/`run-all` already do.
+- **Distributing units across separate processes/containers** (k8s Job
+  parallelism, Airflow mapped tasks, Argo Workflow steps) uses the lower-
+  level primitives `run()` is itself built from:
+
+  ```bash
+  td2hive plan --job jobs/my_table.yaml --processing-date 2026-01-15 ...
+  #   -> one JSON unit per line to stdout
+
+  td2hive prepare --job jobs/my_table.yaml --processing-date 2026-01-15 ...
+  #   -> clears every unit's target path ONCE, before any unit writes -
+  #      must run exactly once, ahead of fan-out (see JobRunner.prepare's
+  #      docstring for why this can't be pushed into each unit's own run)
+
+  # then, once per unit (in parallel, across as many workers as you like):
+  td2hive run-unit --job jobs/my_table.yaml --processing-date 2026-01-15 \
+    --unit '<one line from plan>' --result-file /shared/results/unit-N.json
+
+  # once every run-unit has completed:
+  td2hive reconcile --job jobs/my_table.yaml --processing-date 2026-01-15 \
+    --results-dir /shared/results
+  #   -> the ONLY step that decides success/dq_mismatch, same as run()
+  ```
+
+  `plan`/`reconcile` never touch Docker or DataX - only `run-unit` does,
+  so only that step needs the full runtime (TPT client + DataX
+  distribution). See `docker-compose.yml` (single host, no orchestrator -
+  the easy win: multiple *different* jobs running concurrently),
+  `k8s/` (indexed Job fan-out for *one* job's units, with a glue script
+  since plain k8s Jobs have no native sequencing between separate Job
+  objects), and `integrations/` (Airflow dynamic task mapping, Argo
+  Workflows `withParam` - Argo's model maps almost exactly onto
+  plan/run-unit/reconcile).
+
+  For Kubernetes specifically: the default image's `TPTExporter` spawns a
+  sibling `teradata/tpt` container via the Docker CLI, which needs a
+  Docker daemon most managed clusters don't expose to pods for good
+  security reasons. `docker/Dockerfile.td2hive-tpt` builds `FROM
+  teradata/tpt` instead, so `tbuild` runs as a plain subprocess (auto-
+  detected via `shutil.which` in `reader.py`) with no Docker-in-Docker
+  dependency at all - use that image for k8s, the default one for
+  Compose/bare-host use where a Docker daemon is already right there.
+
 ## Retention
 
 ```bash
