@@ -54,6 +54,11 @@ from .verify import verify
 class RunPaths:
     tpt_output_dir: Path
     datax_logs_dir: Path
+    # Overrides fs.obs.buffer.dir (see datax/job_spec.py's build_job_json
+    # docstring) - the OBS Hadoop connector's own default is /tmp, a
+    # small partition that two real concurrent jobs' writes exhausted in
+    # production 2026-08-21. Empty string keeps the connector's default.
+    obs_buffer_dir: str = ""
 
 
 @dataclass
@@ -132,6 +137,8 @@ class JobRunner:
     ):
         self.td_cursor = td_cursor
         self.tpt_exporter = TPTExporter(td_host, td_user, td_password, str(paths.tpt_output_dir))
+        if paths.obs_buffer_dir:
+            Path(paths.obs_buffer_dir).mkdir(parents=True, exist_ok=True)
         self.obs_config = obs_config
         self.obs_bucket = obs_bucket
         self.audit_sink = audit_sink
@@ -349,10 +356,18 @@ class JobRunner:
             field_delimiter="|",
             setting=job.setting,
             obs_config=self.obs_config,
+            obs_buffer_dir=self.paths.obs_buffer_dir,
         )
+        # Must be unique per load_table, not just file_label: two load
+        # tables can (and do, for real jobs) share the same partition
+        # value - a path keyed on file_label alone silently overwrote one
+        # load table's job.json/log with another's, confirmed against
+        # real production data 2026-08-21 (a second load table's write
+        # for a given partition value landed in the same directory a
+        # first load table's write for that same value had already used).
         run_dir = (
             self.paths.datax_logs_dir / job.table_name
-            / "_".join(u.file_label or u.load_table for u in units)
+            / "_".join(f"{u.load_table}_{u.file_label or 'static'}" for u in units)
         )
         result = self.runner.run(job_json, run_dir)
         if not result.succeeded or not result.within_error_limit(job.setting.error_limit.record):

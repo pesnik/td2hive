@@ -60,6 +60,7 @@ def build_job_json(
     field_delimiter: str,
     setting: RunSetting,
     obs_config: ObsConfig,
+    obs_buffer_dir: str = "",
 ) -> dict:
     """Build one DataX job.json, with one `content` entry per content
     spec sharing a single JVM/channel pool. Multiple partition values'
@@ -78,6 +79,16 @@ def build_job_json(
     name (DATE_KEY=<value>/), not in the file - Hive derives them from
     the path. The CSV(s) still have the full row layout, so this only
     changes which columns the reader *projects* by index.
+
+    `obs_buffer_dir` overrides `fs.obs.buffer.dir` (the Huawei OBS Hadoop
+    connector's local scratch dir for multipart-upload buffering before
+    the real network transfer) - its own default is `${java.io.tmpdir}/obs`,
+    i.e. /tmp, confirmed 2026-08-21 to be a real production risk: two
+    real concurrent jobs' writes both buffering there exhausted /tmp's
+    10GB partition ("No space left on device" mid-write, both jobs
+    failed), while /data01 sat at 1.5TB free the whole time. Leave unset
+    to keep the connector's own default (fine for a single job at a
+    time, risky once more than one job's writes can overlap).
     """
     content = []
     for spec in content_specs:
@@ -114,6 +125,7 @@ def build_job_json(
                 "fs.obs.access.key": obs_config.access_key,
                 "fs.obs.secret.key": obs_config.secret_key,
                 "fs.obs.endpoint": obs_config.endpoint,
+                **({"fs.obs.buffer.dir": obs_buffer_dir} if obs_buffer_dir else {}),
             },
         }
 

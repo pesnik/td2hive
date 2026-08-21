@@ -179,6 +179,12 @@ def _build_runner(
         paths=RunPaths(
             tpt_output_dir=run_id_dir / "tpt",
             datax_logs_dir=Path("/data01/td2hive/logs/datax"),
+            # Overrides fs.obs.buffer.dir - the OBS Hadoop connector's own
+            # default (/tmp) is a small partition that two real
+            # concurrent jobs' writes exhausted in production 2026-08-21
+            # ("No space left on device", both jobs failed). /data01 has
+            # far more headroom (1.5TB free at the time).
+            obs_buffer_dir="/data01/td2hive/tmp/obs",
         ),
         datax_home=datax_home,
     )
