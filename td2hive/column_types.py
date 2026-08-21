@@ -21,8 +21,24 @@ from typing import List, Tuple
 _DECIMAL_LIKE = {"D", "F", "N"}
 _INTEGER_LIKE = {"I", "I1", "I2", "I8"}
 _CHAR_LIKE = {"CV", "CF"}
+# DATE/TIMESTAMP resolve to an explicit CAST to VARCHAR, for the exact
+# same reason DECIMAL casts to FLOAT: TPT's EXPORT operator needs the
+# SELECT's actual result byte-length to match DEFINE SCHEMA exactly, and
+# Teradata's native DATE/TIMESTAMP binary encodings aren't naturally
+# TPT-portable the way a formatted string is. VARCHAR(10) covers
+# 'YYYY-MM-DD'; VARCHAR(26) covers 'YYYY-MM-DD HH:MI:SS.SSSSSS' (TS(6),
+# the widest fractional-second precision Teradata supports) - sized for
+# the worst case rather than the source column's own declared precision,
+# same reasoning DECIMAL's fixed-width FLOAT cast already uses.
+_DATE_LIKE = {"DA"}
+_TIMESTAMP_LIKE = {"TS", "SZ"}  # SZ = TIMESTAMP WITH TIME ZONE
 
-ResolvedColumn = Tuple[str, str, bool]  # (name, tpt_type, needs_float_cast)
+ResolvedColumn = Tuple[str, str, bool]  # (name, tpt_type, needs_cast)
+# When needs_cast is True, tpt_type IS the CAST target - reader.py's
+# build_select_stmt casts every such column to tpt_type directly
+# (`CAST(col AS {tpt_type})`), never a hardcoded type, so adding a new
+# needs_cast case here (as DATE/TIMESTAMP did) never requires a reader.py
+# change too.
 
 # hdfswriter's own type vocabulary (STRING/BIGINT/DOUBLE) - a second,
 # independent mapping from the same dynamically-resolved tpt_type, not a
@@ -68,6 +84,10 @@ def resolve_column_types(
         types_seen = {v[0] for v in variants}
         if types_seen & _DECIMAL_LIKE:
             resolved.append((col, "FLOAT", True))
+        elif types_seen & _DATE_LIKE:
+            resolved.append((col, "VARCHAR(10)", True))
+        elif types_seen & _TIMESTAMP_LIKE:
+            resolved.append((col, "VARCHAR(26)", True))
         elif types_seen <= _INTEGER_LIKE:
             resolved.append((col, "INTEGER", False))
         elif types_seen <= _CHAR_LIKE:

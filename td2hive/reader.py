@@ -106,10 +106,15 @@ def build_select_stmt(
     DEFINE SCHEMA quoting - not required by Teradata SQL itself (NAME
     isn't SQL-reserved), but consistent quoting everywhere a column name
     is embedded avoids depending on which specific words happen to be
-    reserved in which of TPT's job-script grammar vs. Teradata SQL."""
+    reserved in which of TPT's job-script grammar vs. Teradata SQL.
+
+    When needs_cast, casts to tpt_type itself - resolve_column_types()
+    already resolved tpt_type to whatever the CAST's target must be
+    (FLOAT for DECIMAL-like columns, VARCHAR(n) for DATE/TIMESTAMP), so
+    the cast target is never hardcoded here."""
     exprs = [
-        f'CAST("{name}" AS FLOAT) AS "{name}"' if needs_cast else f'"{name}"'
-        for name, _, needs_cast in columns
+        f'CAST("{name}" AS {tpt_type}) AS "{name}"' if needs_cast else f'"{name}"'
+        for name, tpt_type, needs_cast in columns
     ]
     top_clause = f"TOP {row_limit} " if row_limit else ""
     where_sql = f" WHERE {where_clause}" if where_clause else ""
