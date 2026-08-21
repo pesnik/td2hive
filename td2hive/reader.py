@@ -33,7 +33,12 @@ class ObsConfig:
 
 
 def _build_tpt_job_script(columns: List[ResolvedColumn], num_instances: int = 1) -> str:
-    schema_lines = ",\n    ".join(f"{name} {tpt_type}" for name, tpt_type, _ in columns)
+    # Column names are double-quoted here - TPT's own job-script grammar
+    # has a broader reserved-word set than Teradata SQL itself (found
+    # live: a real column named NAME - not reserved in SQL - failed
+    # TPT02954 "missing { REGULAR_IDENTIFIER_ ... }" in DEFINE SCHEMA
+    # unquoted). Quoting is harmless for every other column too.
+    schema_lines = ",\n    ".join(f'"{name}" {tpt_type}' for name, tpt_type, _ in columns)
     # Multiple FILE_WRITER instances writing to `num_instances` output files
     # in parallel, round-robin-distributed by `tbuild -C` (see export()).
     # Validated 2026-08-20 against 2M real rows: exact instance count of
@@ -95,9 +100,15 @@ def build_select_stmt(
     scratch/proof runs only (TOP N). `where_clause` scopes the export to
     one dynamic-partition value (e.g. "DATE_KEY = 7901") - TPT does the
     partitioning itself via one export per distinct value, rather than a
-    single full export split apart afterward in Python."""
+    single full export split apart afterward in Python.
+
+    Column names are double-quoted, matching _build_tpt_job_script's own
+    DEFINE SCHEMA quoting - not required by Teradata SQL itself (NAME
+    isn't SQL-reserved), but consistent quoting everywhere a column name
+    is embedded avoids depending on which specific words happen to be
+    reserved in which of TPT's job-script grammar vs. Teradata SQL."""
     exprs = [
-        f"CAST({name} AS FLOAT) AS {name}" if needs_cast else name
+        f'CAST("{name}" AS FLOAT) AS "{name}"' if needs_cast else f'"{name}"'
         for name, _, needs_cast in columns
     ]
     top_clause = f"TOP {row_limit} " if row_limit else ""
