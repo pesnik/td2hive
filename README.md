@@ -179,12 +179,23 @@ fine for most tables, but a table with hundreds of dynamic partition
 values benefits from spreading the work out. Two separate mechanisms,
 solving two separate costs:
 
-- **DataX JVM cold-start** (real, measured cost per invocation) is fixed
-  by `run()` itself: `job.setting.max_channels_per_job` (default 64)
-  groups multiple partition values' writes into as few `job.json` calls
-  (shared JVM/channel pool) as fit the budget, instead of one JVM launch
-  per partition value. No configuration needed to benefit from this -
-  it's what `run`/`run-all` already do.
+- **DataX JVM cold-start** (real, measured cost per invocation) can be
+  reduced by `run()` itself: `job.setting.max_channels_per_job` groups
+  multiple partition values' writes into fewer `job.json` calls (shared
+  JVM/channel pool) instead of one JVM launch per partition value.
+  **Opt-in, not automatic**: it defaults to `speed_channel` itself, which
+  means no batching at all unless a table's YAML sets it explicitly
+  higher. This was a real production near-miss, not caution for its own
+  sake — a flat default (64) doesn't account for memory scaling with
+  channel count. A wide/heavy table already running close to its memory
+  ceiling at a single partition value's channel count (confirmed: 16
+  channels at ~29GB/32GB, 91% of cap) would have silently had its *entire
+  job* - every load table, every partition value - combined into one
+  untested, oversized JVM under a flat default. Batching's real value is
+  for tables with **many small partitions**, not few wide ones - set
+  `max_channels_per_job` explicitly per table only once you've confirmed
+  the memory headroom for that table's row width, never rely on a shared
+  default to guess right for every table.
 - **Distributing units across separate processes/containers** (k8s Job
   parallelism, Airflow mapped tasks, Argo Workflow steps) uses the lower-
   level primitives `run()` is itself built from:
