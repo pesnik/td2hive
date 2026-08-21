@@ -435,6 +435,14 @@ def create_target_cmd(
 @click.option("--processing-date", default=lambda: date.today().strftime("%Y-%m-%d"),
               help="YYYY-MM-DD, defaults to today")
 @click.option("--row-limit", default=5000, help="Rows per unit for this scratch proof run")
+@click.option("--partition-limit", default=3,
+              help="Max distinct dynamic-partition values to actually process (0 = no limit). "
+                   "row-limit alone does NOT bound this - plan() enumerates one unit per distinct "
+                   "partition value regardless of row-limit, so a table with hundreds of partition "
+                   "values would otherwise run hundreds of full TPT-export cycles sequentially, "
+                   "each paying fixed per-partition overhead (Docker/Kerberos/TPT startup) no "
+                   "matter how small row-limit is set. This caps unit COUNT, independent of "
+                   "row-limit's per-unit cap")
 @click.option("--keep-scratch", is_flag=True,
               help="Leave the scratch Hive table/OBS data in place for inspection instead of tearing it down")
 @_apply_options(_TD_OPTS)
@@ -442,7 +450,7 @@ def create_target_cmd(
 @click.option("--datax-home", default="", envvar="DATAX_HOME")
 @click.option("--tpt-output-dir", default="/data01/td2hive/tpt_output")
 def validate_cmd(
-    job_path: Path, processing_date: str, row_limit: int, keep_scratch: bool,
+    job_path: Path, processing_date: str, row_limit: int, partition_limit: int, keep_scratch: bool,
     td_host: str, td_user: str, td_password: str,
     obs_access_key: str, obs_secret_key: str, obs_endpoint: str, obs_bucket: str,
     datax_home: str, tpt_output_dir: str,
@@ -450,18 +458,27 @@ def validate_cmd(
     """Prove a draft job spec actually works against real Teradata data
     before it's trusted enough for jobs/: creates a scratch Hive table
     matching the draft's real schema (via the same Teradata type
-    resolution a real run would do), loads --row-limit rows into it, and
+    resolution a real run would do), loads --row-limit rows from up to
+    --partition-limit distinct dynamic-partition values into it, and
     reports whether DataX's own reported write count and an independent
     Hive COUNT(*) agree.
 
-    Deliberately does NOT judge success via record.status - `verify()`
-    always compares target_row_count against the FULL unscoped source
-    table's count, which --row-limit can never match by design (it's a
-    scratch proof, not a full load); a dq_mismatch against
-    source_row_count here is expected, not a failure signal. The real
-    question this answers is narrower and more useful pre-promotion:
-    did every row DataX claims to have written actually land in Hive,
-    matching the schema this draft declares.
+    Deliberately does NOT judge success via a full AuditRecord.status -
+    a job spec with a dynamic partition column only ever processes a
+    subset of real partition values here (--partition-limit), and even
+    an unpartitioned table only exports --row-limit rows, so comparing
+    against the FULL unscoped source table's count would always read
+    dq_mismatch by design; that disagreement is not what this command
+    judges. The real question this answers is narrower and more useful
+    pre-promotion: did every row DataX claims to have written actually
+    land in Hive, matching the schema this draft declares, for
+    whichever partition values/rows were actually attempted.
+
+    Uses the plan/prepare/run_units/reconcile primitives directly
+    (never JobRunner.run(), and never a resumability manifest - a fresh
+    scratch table every time makes one unnecessary) specifically so
+    --partition-limit can truncate the unit list plan() enumerates
+    before any TPT export/DataX write work starts.
 
     Tears the scratch Hive table + OBS data down afterward unless
     --keep-scratch is passed."""
@@ -523,21 +540,27 @@ def validate_cmd(
             ),
             datax_home=datax_home,
         )
-        record = runner.run(
-            scratch_job, date.fromisoformat(processing_date), row_limit=row_limit, force=True,
-        )
-        if record is None:
-            raise click.ClickException(
-                "scratch run reported already-succeeded, which force=True should have prevented - "
-                "this points at a bug in JobRunner.run(), not this draft"
+        processing_date_obj = date.fromisoformat(processing_date)
+        units = runner.plan(scratch_job, processing_date_obj)
+        if partition_limit and len(units) > partition_limit:
+            click.echo(
+                f"plan() found {len(units)} distinct unit(s) (partition values x load tables) - "
+                f"capping to the first {partition_limit} via --partition-limit, so this proof run "
+                f"doesn't pay full per-partition TPT/DataX overhead for every value the real table "
+                f"has. Pass --partition-limit 0 to remove this cap and test every unit."
             )
+            units = units[:partition_limit]
+        runner.prepare(units)
+        unit_results = runner.run_units(scratch_job, units, row_limit=row_limit)
+        record = runner.reconcile(scratch_job, processing_date_obj, unit_results)
 
         click.echo(f"DataX reported: {record.datax_reported_count} row(s) written")
         click.echo(f"Hive independently counted: {record.target_row_count} row(s)")
         click.echo(
             f"(status={record.status} against source_row_count={record.source_row_count} is expected to "
-            f"read dq_mismatch here - --row-limit={row_limit} deliberately doesn't export the whole "
-            f"source table - that disagreement is not what this command is judging.)"
+            f"read dq_mismatch here - --row-limit={row_limit} and --partition-limit={partition_limit} "
+            f"deliberately don't export the whole source table - that disagreement is not what this "
+            f"command is judging.)"
         )
 
         if record.target_row_count > 0 and record.target_row_count == record.datax_reported_count:
