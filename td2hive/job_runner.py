@@ -34,7 +34,7 @@ sequential Python process:
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from loguru import logger
 
@@ -48,6 +48,13 @@ from .partition_registrar import PartitionRegistrar, PartitionSpec
 from .obs_client import delete_prefix, ensure_prefix_exists
 from .reader import ObsConfig, TPTExporter
 from .verify import verify
+
+if TYPE_CHECKING:
+    # Deferred: run_manifest.py imports Unit from this module, so a
+    # module-level import here would be circular. Only ever used for
+    # type hints - the real import in run() is a local, call-time import
+    # instead (see run()'s own docstring).
+    from .run_manifest import ManifestStore, RunManifest
 
 
 @dataclass
@@ -134,6 +141,7 @@ class JobRunner:
         audit_sink,
         paths: RunPaths,
         datax_home: Optional[str] = None,
+        manifest_store: "Optional[ManifestStore]" = None,
     ):
         self.td_cursor = td_cursor
         self.tpt_exporter = TPTExporter(td_host, td_user, td_password, str(paths.tpt_output_dir))
@@ -146,6 +154,21 @@ class JobRunner:
         self.registrar = PartitionRegistrar()
         self._datax_home_arg = datax_home or ""
         self._runner: Optional[DataxRunner] = None
+        self._manifest_store = manifest_store
+
+    @property
+    def manifest_store(self) -> "ManifestStore":
+        """Lazy, same reasoning as the `runner` property: only run()
+        actually needs this (plan()/prepare()/reconcile() don't), and
+        constructing the zero-config default (one shared JSONL file
+        under datax_logs_dir, mirroring audit/'s JSONLFileAuditSink) here
+        keeps every other JobRunner method free of a dependency on it.
+        Pass your own ManifestStore to __init__ to use something else -
+        see run_manifest.py's module docstring."""
+        if self._manifest_store is None:
+            from .run_manifest import JSONLManifestStore
+            self._manifest_store = JSONLManifestStore(self.paths.datax_logs_dir / "run_manifest.jsonl")
+        return self._manifest_store
 
     @property
     def runner(self) -> DataxRunner:
@@ -244,7 +267,7 @@ class JobRunner:
     # prepare
     # ------------------------------------------------------------------
 
-    def prepare(self, units: List[Unit]) -> None:
+    def prepare(self, units: List[Unit], manifest: "Optional[RunManifest]" = None) -> None:
         """Clear every unit's target OBS path exactly once before any
         unit writes. Must run as a single, one-time step ahead of the
         whole fan-out - NOT something each run_unit() can safely do for
@@ -257,9 +280,23 @@ class JobRunner:
         delete-then-write is the sole idempotency mechanism for this
         loader - hdfswriter's own writeMode stays 'append' (see
         jobspec.RunSetting) precisely so it never also tries to manage
-        conflicts in the same directory."""
+        conflicts in the same directory.
+
+        `manifest` (resumed `run()` calls only - see run_manifest.py):
+        never clear a target_path any already-`written` unit uses - it
+        already holds good, independently-verified-eventually data from
+        this same run; clearing it would destroy real work just to
+        "resume" a job that doesn't need that unit redone at all."""
+        paths_with_written_data: set = set()
+        if manifest is not None:
+            for unit in units:
+                if manifest.is_written(unit):
+                    paths_with_written_data.add(unit.target_path)
+
         cleared_paths: set = set()
         for unit in units:
+            if unit.target_path in paths_with_written_data:
+                continue
             if unit.target_path in cleared_paths:
                 continue
             deleted = delete_prefix(
@@ -290,14 +327,21 @@ class JobRunner:
         results = self._run_batch(job, [unit], columns, row_limit=row_limit)
         return results[0]
 
-    def run_units(self, job: JobSpec, units: List[Unit], row_limit: int = 0) -> List[UnitResult]:
+    def run_units(
+        self, job: JobSpec, units: List[Unit], row_limit: int = 0,
+        manifest: "Optional[RunManifest]" = None,
+    ) -> List[UnitResult]:
         """Same work as calling run_unit() once per unit, but groups
         multiple units' DataX writes into as few job.json calls as fit
         under job.setting.max_channels_per_job - each batch shares one
         JVM instead of paying a fresh cold-start per partition value.
         Used by the sequential single-container run() path; never used
         by run_unit() itself (batching across externally-scheduled
-        pods/containers would defeat the point of distributing them)."""
+        pods/containers would defeat the point of distributing them).
+
+        `manifest` (resumed `run()` calls only): a unit already marked
+        `written` is skipped entirely - its persisted UnitResult is
+        reused as-is, no TPT export, no DataX write, no JVM launch."""
         columns = resolve_column_types(
             self.td_cursor, job.source.owner, job.source.load_tables, job.source.columns
         )
@@ -305,20 +349,35 @@ class JobRunner:
         budget = max(1, job.setting.max_channels_per_job)
 
         results: List[UnitResult] = []
+        pending: List[Unit] = []
+        for unit in units:
+            state = manifest.get(unit) if manifest is not None else None
+            if state is not None and state.status == "written":
+                logger.info(
+                    f"{unit.load_table}/{unit.file_label or 'static'}: already written "
+                    f"(resumed run) - skipping export and write entirely"
+                )
+                results.append(UnitResult(
+                    unit=unit, records_read=state.records_read, records_failed=state.records_failed
+                ))
+            else:
+                pending.append(unit)
+
         batch: List[Unit] = []
         batch_channels = 0
-        for unit in units:
+        for unit in pending:
             if batch and batch_channels + num_instances > budget:
-                results.extend(self._run_batch(job, batch, columns, row_limit=row_limit))
+                results.extend(self._run_batch(job, batch, columns, row_limit=row_limit, manifest=manifest))
                 batch, batch_channels = [], 0
             batch.append(unit)
             batch_channels += num_instances
         if batch:
-            results.extend(self._run_batch(job, batch, columns, row_limit=row_limit))
+            results.extend(self._run_batch(job, batch, columns, row_limit=row_limit, manifest=manifest))
         return results
 
     def _run_batch(
-        self, job: JobSpec, units: List[Unit], columns: List[ResolvedColumn], row_limit: int = 0
+        self, job: JobSpec, units: List[Unit], columns: List[ResolvedColumn], row_limit: int = 0,
+        manifest: "Optional[RunManifest]" = None,
     ) -> List[UnitResult]:
         """Runs one or more units as ONE DataX job.json (one JVM, one
         content block per unit). TPT export stays one call per unit
@@ -326,21 +385,39 @@ class JobRunner:
         files, it doesn't route by column value into a named file, so a
         combined multi-value TPT export can't produce per-value output
         without a local re-split (the exact double-I/O this pipeline's
-        redesign eliminated - see reader.py)."""
+        redesign eliminated - see reader.py).
+
+        `manifest` (resumed `run()` calls only): a unit already marked
+        `exported`, with its CSVs still present and non-empty, skips a
+        fresh TPT export and reuses those files - a real failure mode
+        this exists for, not a hypothetical one: two concurrent
+        production jobs failed mid-DataX-write 2026-08-21 after their
+        TPT exports had already fully succeeded; without this, a retry
+        would have re-exported everything from scratch."""
         num_instances = max(1, job.setting.speed_channel)
 
         content_specs = []
         unit_csv_paths: List[List[Path]] = []
         for unit in units:
-            csv_paths = self.tpt_exporter.export(
-                job.source.owner,
-                unit.load_table,
-                columns,
-                row_limit=row_limit,
-                where_clause=unit.where_clause,
-                num_instances=num_instances,
-                file_label=unit.file_label,
-            )
+            reused = manifest.valid_exported_csv_paths(unit) if manifest is not None else None
+            if reused is not None:
+                logger.info(
+                    f"{unit.load_table}/{unit.file_label or 'static'}: reusing previously "
+                    f"exported CSVs (resumed run) - skipping TPT export"
+                )
+                csv_paths = reused
+            else:
+                csv_paths = self.tpt_exporter.export(
+                    job.source.owner,
+                    unit.load_table,
+                    columns,
+                    row_limit=row_limit,
+                    where_clause=unit.where_clause,
+                    num_instances=num_instances,
+                    file_label=unit.file_label,
+                )
+                if manifest is not None:
+                    manifest.mark_exported(unit, csv_paths)
             unit_csv_paths.append(csv_paths)
             content_specs.append(ContentSpec(
                 local_csv_paths=csv_paths,
@@ -396,10 +473,14 @@ class JobRunner:
             for p in csv_paths:
                 p.unlink(missing_ok=True)
 
-        return [
+        results = [
             UnitResult(unit=u, records_read=per_unit_read, records_failed=per_unit_failed)
             for u in units
         ]
+        if manifest is not None:
+            for r in results:
+                manifest.mark_written(r.unit, r.records_read, r.records_failed)
+        return results
 
     # ------------------------------------------------------------------
     # reconcile
@@ -477,7 +558,22 @@ class JobRunner:
         (idempotency check, final AuditRecord, success/dq_mismatch
         semantics) is exactly what it was before this file was split
         into phases; only the internal shape changed. `row_limit` is for
-        scratch/proof runs only (TOP N per unit)."""
+        scratch/proof runs only (TOP N per unit).
+
+        Resumable across failures via a persisted per-unit manifest (see
+        run_manifest.py) - a real, not hypothetical, need: two concurrent
+        production jobs both failed mid-DataX-write 2026-08-21 (local
+        disk exhaustion), after their TPT exports had already fully
+        succeeded. A bare re-run now skips any unit already `written`
+        entirely and reuses any unit's already-`exported` CSVs instead of
+        re-exporting them, rather than redoing the whole job from
+        scratch. `force=True` skips loading any prior manifest state and
+        starts from a clean slate, same semantics it already has for the
+        audit "already succeeded" check - the manifest store is
+        append-only (see run_manifest.py), so "starting fresh" means not
+        consulting history, not erasing it."""
+        from .run_manifest import RunManifest  # local: avoids a circular import, see module docstring
+
         start_time = datetime.now()
         date_str = processing_date.strftime("%Y-%m-%d")
 
@@ -485,7 +581,11 @@ class JobRunner:
             logger.info(f"{job.table_name}/{date_str} already succeeded, skipping (use force=True to re-run)")
             return None
 
+        manifest = RunManifest(self.manifest_store, job.table_name, date_str)
+        if not force:
+            manifest.load()
+
         units = self.plan(job, processing_date)
-        self.prepare(units)
-        unit_results = self.run_units(job, units, row_limit=row_limit)
+        self.prepare(units, manifest=manifest)
+        unit_results = self.run_units(job, units, row_limit=row_limit, manifest=manifest)
         return self.reconcile(job, processing_date, unit_results, start_time=start_time)

@@ -238,6 +238,40 @@ solving two separate costs:
   dependency at all - use that image for k8s, the default one for
   Compose/bare-host use where a Docker daemon is already right there.
 
+## Resumability
+
+`td2hive run` self-heals across transient failures instead of restarting
+a job from zero. A per-`(job, processing_date)` manifest tracks each
+unit's real progress - `exported` (TPT done, local CSV paths recorded)
+or `written` (DataX write + partition registration done) - so a bare
+re-run after a failure:
+
+- skips any unit already `written` entirely (no re-export, no re-write,
+  and its target path is never re-cleared - it already holds good,
+  verified data);
+- for a unit that exported successfully but whose DataX write failed,
+  validates its CSVs are still present and non-empty, then retries only
+  the write, not the export.
+
+This is a real, not hypothetical, need: two concurrent production jobs
+once failed mid-DataX-write from local disk exhaustion, after their TPT
+exports had already fully succeeded - without this, a retry would have
+re-exported everything from scratch. `--force` skips loading prior
+manifest state and starts from a clean slate.
+
+Storage is pluggable via `ManifestStore` (`td2hive/run_manifest.py`),
+mirroring the audit sink design below - `JSONLManifestStore` (one shared
+append-only file, same pattern as `JSONLFileAuditSink`) is the
+zero-config default; a SQL-backed store for centralized visibility
+across many tables' in-flight runs is a natural future addition, not
+built until there's real demand for it.
+
+Deliberately scoped to `run()`'s sequential path only - `run-unit` used
+via a real orchestrator (k8s/Airflow/Argo) already gets equivalent
+retry-without-redoing-everything behavior for free from the
+orchestrator's own per-task retry, since each `run-unit` call is already
+atomic to one partition value.
+
 ## Retention
 
 ```bash
