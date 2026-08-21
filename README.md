@@ -172,6 +172,12 @@ You'll also need, on whatever host runs `td2hive run`:
    the result. `status` is `success` or `dq_mismatch`, decided entirely
    by the independent count comparison in `verify.py`.
 
+The example above is hand-written for a table you already understand.
+Onboarding a table from an existing legacy config table - deriving the
+real column order, proving it against real data, and picking a safe
+`speed_channel` before it ever touches `jobs/` - is its own repeatable
+sequence: see [`docs/onboarding.md`](docs/onboarding.md).
+
 ## Scaling: one job across many workers
 
 `td2hive run` does everything sequentially in one process/container -
