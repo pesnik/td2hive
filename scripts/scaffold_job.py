@@ -167,10 +167,17 @@ def main(
     load_tables_raw = config.get("TD_LD_TAB_NAME") or ""
     load_tables = [t.strip() for t in load_tables_raw.split(";") if t.strip()]
     if not load_tables:
-        raise click.ClickException(
-            f"{table_name}: TD_LD_TAB_NAME is empty in the legacy config - this table doesn't "
-            f"appear to have load tables defined; scaffold_job.py doesn't handle that shape yet."
-        )
+        # No separate load table configured (the common case for most
+        # tables - a dedicated load table is the exception, not the
+        # rule). Falls back to the single source table directly, same
+        # as the legacy pipeline's own standard-query path does when it
+        # has no load table configured either.
+        if not config.get("TD_TAB_NAME"):
+            raise click.ClickException(
+                f"{table_name}: neither TD_LD_TAB_NAME nor TD_TAB_NAME is set in the legacy "
+                f"config - no source table to scaffold from."
+            )
+        load_tables = [config["TD_TAB_NAME"]]
 
     hive_owner = config["HIVE_TAB_OWNER"]
     hive_table = config["HIVE_TAB_NAME"]
