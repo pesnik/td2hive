@@ -150,8 +150,8 @@ def run_all(
     alert_sms_gateway_url: str, alert_sms_username: str, alert_sms_password: str,
     alert_sms_from: str, alert_recipients: str,
 ):
-    """Run every DataX-loader job spec under jobs-dir for one processing date."""
-    jobs = [j for j in load_jobs_dir(jobs_dir) if j.uses_datax]
+    """Run every enabled DataX-loader job spec under jobs-dir for one processing date."""
+    jobs = [j for j in load_jobs_dir(jobs_dir) if j.uses_datax and j.enabled]
     failures = 0
     for job in jobs:
         try:
@@ -173,6 +173,31 @@ def run_all(
             failures += 1
     if failures:
         raise SystemExit(1)
+
+
+@cli.command("list-jobs")
+@click.option("--jobs-dir", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--include-disabled", is_flag=True,
+              help="Also list jobs with enabled: false (excluded by default, same as run-all)")
+def list_jobs_cmd(jobs_dir: Path, include_disabled: bool):
+    """List every enabled DataX-loader job under jobs-dir as one JSON
+    line per job (table_name + file + enabled). Lets a scheduler
+    (Airflow dynamic task mapping, a k8s CronJob's own discovery step,
+    ...) discover jobs at run time instead of hardcoding a per-table
+    list anywhere - promoting a job YAML into jobs/ should be the only
+    step needed to onboard a table into scheduling, the same ergonomics
+    a MySQL-config-driven legacy pipeline already had (adding a row
+    there never required a code change either). Same enabled/uses_datax
+    filter as run-all, so a scheduler built on this command's output
+    and a manual `run-all` invocation never disagree about which jobs
+    are currently active. Read-only: never touches Teradata/Hive/OBS."""
+    for path in sorted(jobs_dir.glob("*.yaml")):
+        job = load_jobspec(path)
+        if not job.uses_datax:
+            continue
+        if not job.enabled and not include_disabled:
+            continue
+        click.echo(json.dumps({"table_name": job.table_name, "file": path.name, "enabled": job.enabled}))
 
 
 def _build_runner(

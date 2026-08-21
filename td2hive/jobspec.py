@@ -101,6 +101,15 @@ class JobSpec:
     # most tables' blank RETENTION column today) means never expire - a
     # table must opt in explicitly, retention is never implicit.
     retention_days: Optional[int] = None
+    # Pause a table's scheduling without deleting/moving its job YAML -
+    # the same purpose a legacy config table's own SKIP-style column
+    # would serve. Defaults to True so every job YAML written before
+    # this field existed keeps working unchanged. Checked by
+    # run-all/list-jobs, the two commands that decide "which jobs
+    # actually run right now" - a single `td2hive run --job x.yaml`
+    # against a disabled job still runs, deliberately: `enabled=False`
+    # means "the scheduler skips this," not "this job cannot be run."
+    enabled: bool = True
 
     @property
     def uses_datax(self) -> bool:
@@ -154,6 +163,7 @@ def load_jobspec(path: Path) -> JobSpec:
         loader=raw["loader"],
         setting=setting,
         retention_days=raw.get("retention_days"),
+        enabled=raw.get("enabled", True),
     )
 
 
