@@ -92,7 +92,18 @@ def resolve_column_types(
             resolved.append((col, "INTEGER", False))
         elif types_seen <= _CHAR_LIKE:
             max_len = max((v[1] or 0) for v in variants)
-            resolved.append((col, f"VARCHAR({max_len or 1})", False))
+            # CF (fixed CHAR) declared as VARCHAR without a cast fails
+            # TPT's strict schema binding - confirmed live: TPT02639
+            # "Conflicting data type... Source column's data type
+            # (VARCHAR) Target column's data type (CHAR)". An explicit
+            # CAST(col AS VARCHAR(n)) is needed for any CF variant - also
+            # correctly handles a CV/CF mix across load tables, and
+            # incidentally strips CHAR's fixed-width trailing-space
+            # padding, which is the right behavior for a Hive STRING
+            # column anyway. Pure CV needs no cast (the SELECT already
+            # returns VARCHAR, matching DEFINE SCHEMA exactly).
+            needs_char_cast = bool(types_seen - {"CV"})
+            resolved.append((col, f"VARCHAR({max_len or 1})", needs_char_cast))
         else:
             raise ValueError(
                 f"Column {col} has unsupported/mixed type(s) {types_seen} across "
