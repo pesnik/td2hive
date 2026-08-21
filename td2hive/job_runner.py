@@ -160,14 +160,15 @@ class JobRunner:
     def manifest_store(self) -> "ManifestStore":
         """Lazy, same reasoning as the `runner` property: only run()
         actually needs this (plan()/prepare()/reconcile() don't), and
-        constructing the zero-config default (one shared JSONL file
-        under datax_logs_dir, mirroring audit/'s JSONLFileAuditSink) here
-        keeps every other JobRunner method free of a dependency on it.
-        Pass your own ManifestStore to __init__ to use something else -
-        see run_manifest.py's module docstring."""
+        constructing the zero-config default here keeps every other
+        JobRunner method free of a dependency on it. Default is one
+        small JSONL file per (job, processing_date) run under
+        datax_logs_dir - see run_manifest.py's module docstring for why
+        that's a per-run file, not one shared growing log. Pass your own
+        ManifestStore to __init__ to use something else."""
         if self._manifest_store is None:
             from .run_manifest import JSONLManifestStore
-            self._manifest_store = JSONLManifestStore(self.paths.datax_logs_dir / "run_manifest.jsonl")
+            self._manifest_store = JSONLManifestStore(self.paths.datax_logs_dir)
         return self._manifest_store
 
     @property
@@ -569,9 +570,11 @@ class JobRunner:
         re-exporting them, rather than redoing the whole job from
         scratch. `force=True` skips loading any prior manifest state and
         starts from a clean slate, same semantics it already has for the
-        audit "already succeeded" check - the manifest store is
-        append-only (see run_manifest.py), so "starting fresh" means not
-        consulting history, not erasing it."""
+        audit "already succeeded" check. The manifest is deleted once
+        this run reaches `success` - past that point it's permanently
+        useless (nothing left to resume), matching this package's
+        existing posture on local run artifacts: keep on failure for
+        debugging, clean up once independently verified successful."""
         from .run_manifest import RunManifest  # local: avoids a circular import, see module docstring
 
         start_time = datetime.now()
@@ -588,4 +591,7 @@ class JobRunner:
         units = self.plan(job, processing_date)
         self.prepare(units, manifest=manifest)
         unit_results = self.run_units(job, units, row_limit=row_limit, manifest=manifest)
-        return self.reconcile(job, processing_date, unit_results, start_time=start_time)
+        record = self.reconcile(job, processing_date, unit_results, start_time=start_time)
+        if record.status == "success":
+            manifest.clear()
+        return record

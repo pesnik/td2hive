@@ -260,9 +260,15 @@ re-exported everything from scratch. `--force` skips loading prior
 manifest state and starts from a clean slate.
 
 Storage is pluggable via `ManifestStore` (`td2hive/run_manifest.py`),
-mirroring the audit sink design below - `JSONLManifestStore` (one shared
-append-only file, same pattern as `JSONLFileAuditSink`) is the
-zero-config default; a SQL-backed store for centralized visibility
+mirroring the audit sink design below - `JSONLManifestStore` is the
+zero-config default, one small append-only file per `(job,
+processing_date)` run (`<datax-logs-dir>/<job>/<date>/manifest.jsonl`),
+not one shared growing log for every table and every day this pipeline
+has ever run - find what happened for one run by opening its one file,
+and the file is deleted once that run reaches `success` (past that point
+it's permanently useless, matching how local TPT-exported CSVs are
+already treated: kept on failure for debugging, cleaned up once
+independently verified). A SQL-backed store for centralized visibility
 across many tables' in-flight runs is a natural future addition, not
 built until there's real demand for it.
 

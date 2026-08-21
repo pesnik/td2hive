@@ -18,14 +18,21 @@ give the sequential path that same property without an orchestrator.
 Storage is pluggable via ManifestStore, mirroring audit/'s AuditSink
 design - a package can't assume where an adopter wants this state to
 live any more than it can assume that for audit records.
-JSONLManifestStore (below) is the zero-config default, following the
-exact same pattern as audit/jsonl_sink.py's JSONLFileAuditSink: one
-shared append-only file, one JSON event per line, replayed and folded
-(last event per unit wins) to reconstruct current state. A SQL-backed
-store (matching audit.SQLAuditSink's pattern, for centralized visibility
-across many tables' in-flight runs) is a natural future addition once
-there's real demand for it - not built until then, same posture SQL
-support for audit itself had.
+JSONLManifestStore (below) is the zero-config default - one small
+append-only file per (job, processing_date) run, not one shared file
+for every table and every day this pipeline has ever run. That's a
+deliberate difference from JSONLFileAuditSink's single-file design:
+audit history is meant to accumulate forever for reporting; a manifest
+entry is permanently useless the moment its run reaches success (there's
+nothing left to resume), so it belongs in its own small, easily-found,
+easily-pruned file - same directory convention already used everywhere
+else in this package (tpt_output/<table>/<date>/, datax run logs, etc.),
+not a growing log a human would have to grep through every table's every
+day to find one run's state. A SQL-backed store (matching
+audit.SQLAuditSink's pattern, for centralized visibility across many
+tables' in-flight runs) is a natural future addition once there's real
+demand for it - not built until then, same posture SQL support for audit
+itself had.
 """
 
 import json
@@ -51,43 +58,44 @@ class ManifestStore(Protocol):
 
     def load_state(self, job_name: str, processing_date: str) -> Dict[str, UnitState]: ...
 
+    def clear(self, job_name: str, processing_date: str) -> None: ...
+
 
 class JSONLManifestStore:
-    """Default: one shared append-only JSONL file. Zero config, zero
-    external dependency - every install gets working resumability with
-    no setup, the same posture JSONLFileAuditSink already has for audit
-    records."""
+    """Default: one small append-only JSONL file per (job, processing_date)
+    run, at <base_dir>/<job_name>/<processing_date>/manifest.jsonl - find
+    "what happened for table X on date Y" by opening that one file, not
+    grepping a single ever-growing shared log. Append-only *within* a
+    run's file for the same crash-safety reason JSONLFileAuditSink is
+    append-only (a partial last line at worst, never a half-written
+    file); the file itself is deleted once the run no longer needs it
+    (see clear(), called by run() on success)."""
 
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, base_dir: Path):
+        self.base_dir = Path(base_dir)
+
+    def _path(self, job_name: str, processing_date: str) -> Path:
+        return self.base_dir / job_name / processing_date / "manifest.jsonl"
 
     def record_event(
         self, job_name: str, processing_date: str, unit_key: str, state: UnitState
     ) -> None:
-        event = {
-            "job_name": job_name,
-            "processing_date": processing_date,
-            "unit_key": unit_key,
-            **asdict(state),
-        }
-        with open(self.path, "a") as f:
+        path = self._path(job_name, processing_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = {"unit_key": unit_key, **asdict(state)}
+        with open(path, "a") as f:
             f.write(json.dumps(event) + "\n")
 
     def load_state(self, job_name: str, processing_date: str) -> Dict[str, UnitState]:
+        path = self._path(job_name, processing_date)
         result: Dict[str, UnitState] = {}
-        if not self.path.exists():
+        if not path.exists():
             return result
-        with open(self.path) as f:
+        with open(path) as f:
             for line in f:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    continue
-                if (
-                    event.get("job_name") != job_name
-                    or event.get("processing_date") != processing_date
-                ):
                     continue
                 unit_key = event.get("unit_key")
                 if not unit_key:
@@ -99,6 +107,9 @@ class JSONLManifestStore:
                     records_failed=event.get("records_failed", 0),
                 )
         return result
+
+    def clear(self, job_name: str, processing_date: str) -> None:
+        self._path(job_name, processing_date).unlink(missing_ok=True)
 
 
 class RunManifest:
@@ -117,6 +128,15 @@ class RunManifest:
     def load(self) -> "RunManifest":
         self.units = self.store.load_state(self.job_name, self.processing_date)
         return self
+
+    def clear(self) -> None:
+        """Call once this run reaches success - the manifest is
+        permanently useless past that point (nothing left to resume),
+        and JSONLManifestStore's per-run file layout makes deleting it a
+        cheap, safe, local operation, unlike a shared log where "clear"
+        would mean surgically removing lines."""
+        self.units = {}
+        self.store.clear(self.job_name, self.processing_date)
 
     @staticmethod
     def key_for(unit: Unit) -> str:
