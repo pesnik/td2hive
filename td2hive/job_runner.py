@@ -519,12 +519,36 @@ class JobRunner:
                 f"obs://{self.obs_bucket}{target_path}",
             )
 
+        # Scope the source-side count to exactly the dynamic partition
+        # values this run actually processed - never the source table's
+        # entire history. For a table with a dynamic partition column
+        # and no separate load table (the source IS the full historical
+        # fact table, not a narrow daily staging table), an unscoped
+        # COUNT(*) can be enormous or fail outright: confirmed live on a
+        # real table with tens of thousands of PARTITION BY RANGE_N
+        # partitions, which threw a Teradata numeric-overflow error on a
+        # bare COUNT(*). Comparing against the whole table's history was
+        # never the right check for an incremental dynamic-partition
+        # load anyway - only what THIS run wrote should be verified
+        # against what THIS run's source values actually contain.
+        # Empty for a table with no dynamic partition column (every
+        # `partition_values` tuple is then empty) - matches the existing,
+        # correct behavior for snapshot/dimension tables that replace
+        # their entire content under one processing_date partition.
+        source_clauses = [
+            " AND ".join(f"{col} = {val}" for col, val in partition_values)
+            for partition_values in registered_partitions
+            if partition_values
+        ]
+        source_where = " OR ".join(f"({clause})" for clause in source_clauses)
+
         result = verify(
             self.td_cursor,
             job.source.owner,
             job.source.load_tables,
             job.target.hive_owner,
             job.target.hive_table,
+            source_where=source_where,
             hive_where=f'processing_date="{date_str}"',
             registrar=self.registrar,
         )
