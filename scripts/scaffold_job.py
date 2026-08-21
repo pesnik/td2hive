@@ -180,20 +180,26 @@ def main(
             f"No row in {mysql_database}.td_backcup_config with HIVE_TAB_NAME = {table_name!r}"
         )
 
-    td_owner = config.get("TD_LD_TAB_OWNER") or config["TD_TAB_OWNER"]
-    load_tables_raw = config.get("TD_LD_TAB_NAME") or ""
-    load_tables = [t.strip() for t in load_tables_raw.split(";") if t.strip()]
-    if not load_tables:
-        # No separate load table configured (the common case for most
-        # tables - a dedicated load table is the exception, not the
-        # rule). Falls back to the single source table directly, same
-        # as the legacy pipeline's own standard-query path does when it
-        # has no load table configured either.
-        if not config.get("TD_TAB_NAME"):
+    # owner and load_tables must be resolved TOGETHER, from the same
+    # field pair - never TD_LD_TAB_OWNER combined with a TD_TAB_NAME
+    # fallback (or vice versa). A legacy config row can have
+    # TD_LD_TAB_OWNER set (e.g. pointing at a schema of views) while
+    # TD_LD_TAB_NAME is empty - mixing that owner with the TD_TAB_NAME
+    # fallback can silently query the wrong object entirely (confirmed
+    # live: one real table's TD_LD_TAB_OWNER pointed at a VIEW schema
+    # with no matching TD_LD_TAB_NAME; the real base table lived under
+    # TD_TAB_OWNER instead).
+    is_load_table = bool(config.get("TD_LD_TAB_NAME")) and bool(config.get("TD_LD_TAB_OWNER"))
+    if is_load_table:
+        td_owner = config["TD_LD_TAB_OWNER"]
+        load_tables = [t.strip() for t in config["TD_LD_TAB_NAME"].split(";") if t.strip()]
+    else:
+        if not config.get("TD_TAB_NAME") or not config.get("TD_TAB_OWNER"):
             raise click.ClickException(
-                f"{table_name}: neither TD_LD_TAB_NAME nor TD_TAB_NAME is set in the legacy "
-                f"config - no source table to scaffold from."
+                f"{table_name}: no usable Teradata source in the legacy config - neither "
+                f"TD_LD_TAB_OWNER+TD_LD_TAB_NAME nor TD_TAB_OWNER+TD_TAB_NAME are both set."
             )
+        td_owner = config["TD_TAB_OWNER"]
         load_tables = [config["TD_TAB_NAME"]]
 
     hive_owner = config["HIVE_TAB_OWNER"]
