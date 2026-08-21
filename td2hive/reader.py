@@ -20,6 +20,22 @@ from loguru import logger
 
 from .column_types import ResolvedColumn
 
+# Field delimiter shared by the TPT export CSV and DataX's read of it
+# (job_runner.py passes this same value into build_job_json's
+# field_delimiter). Not '|' - confirmed live: a real VARCHAR column
+# value containing a literal '|' (or an embedded newline) silently
+# misaligned every column after it, since DELIMITED text has no
+# quoting/escaping mechanism here. ASCII SOH (0x01) is the standard
+# choice for exactly this reason - the same reasoning Hive's own
+# default field delimiter uses it - real business text essentially
+# never contains a raw control character. Emitted as the Teradata hex
+# literal X'01' in the TPT script (a text literal, not a raw
+# non-printable byte embedded in the script file); DataX's job.json
+# gets this same character as a plain Python string value, which the
+# json module already escapes correctly on its own.
+FIELD_DELIMITER = "\x01"
+_TPT_TEXT_DELIMITER_LITERAL = "X'01'"
+
 
 @dataclass
 class ObsConfig:
@@ -78,7 +94,7 @@ DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
     VARCHAR DirectoryPath = @OutputDir,
     VARCHAR FileName = @OutputFile,
     VARCHAR Format = 'DELIMITED',
-    VARCHAR TextDelimiter = '|',
+    VARCHAR TextDelimiter = {_TPT_TEXT_DELIMITER_LITERAL},
     VARCHAR OpenMode = 'Write',
     VARCHAR IndicatorMode = 'N'
   );

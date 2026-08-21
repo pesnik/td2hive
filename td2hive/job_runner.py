@@ -46,7 +46,7 @@ from .datax.runner import DataxRunner
 from .jobspec import JobSpec
 from .partition_registrar import PartitionRegistrar, PartitionSpec
 from .obs_client import delete_prefix, ensure_prefix_exists
-from .reader import ObsConfig, TPTExporter
+from .reader import FIELD_DELIMITER, ObsConfig, TPTExporter
 from .verify import verify
 
 if TYPE_CHECKING:
@@ -431,7 +431,7 @@ class JobRunner:
             content_specs=content_specs,
             columns=columns,
             file_type=job.target.format,
-            field_delimiter="|",
+            field_delimiter=FIELD_DELIMITER,
             setting=job.setting,
             obs_config=self.obs_config,
             obs_buffer_dir=self.paths.obs_buffer_dir,
