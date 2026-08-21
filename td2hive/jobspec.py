@@ -68,7 +68,25 @@ class RunSetting:
     # externally-parallelizable primitive for k8s/Airflow/Argo) always
     # does exactly one partition value per JVM by design, since batching
     # across pods/containers would defeat the point of distributing them.
-    max_channels_per_job: int = 64
+    #
+    # None (the default) resolves to speed_channel in __post_init__ -
+    # i.e. NO batching benefit unless a table explicitly opts into a
+    # higher value. A flat constant default here was a real mistake,
+    # found live against production: memory scales with channel count
+    # (a real 16-channel single-partition-value write already sat at
+    # ~29GB/32GB, 91% of cap, on a ~36-column table), and a flat 64
+    # silently let job_runner combine ALL of a 2-load-table job's units
+    # (2 load tables x 2 partition values x 16 channels = 64) into ONE
+    # JVM - untested territory that could plausibly have OOM'd. Batching's
+    # real value is for tables with MANY SMALL partitions, not few
+    # wide/heavy ones - opt in per table by setting this explicitly once
+    # you've confirmed the memory headroom, don't rely on a shared
+    # default to guess right for every table's row width.
+    max_channels_per_job: Optional[int] = None
+
+    def __post_init__(self):
+        if self.max_channels_per_job is None:
+            self.max_channels_per_job = self.speed_channel
 
 
 @dataclass
@@ -123,7 +141,10 @@ def load_jobspec(path: Path) -> JobSpec:
         ),
         speed_channel=setting_raw.get("speed_channel", 1),
         write_mode=setting_raw.get("write_mode", "append"),
-        max_channels_per_job=setting_raw.get("max_channels_per_job", 64),
+        # None -> RunSetting.__post_init__ resolves it to speed_channel
+        # (no batching benefit unless a table opts in explicitly - see
+        # the field's own docstring for why a flat constant was wrong).
+        max_channels_per_job=setting_raw.get("max_channels_per_job"),
     )
 
     return JobSpec(
