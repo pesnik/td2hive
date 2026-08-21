@@ -104,6 +104,17 @@ DESCRIPTION 'Export one Teradata table to a delimited flat file via FastExport'
     VARCHAR FileName = @OutputFile,
     VARCHAR Format = 'DELIMITED',
     VARCHAR TextDelimiterHex = '{_TPT_TEXT_DELIMITER_HEX}',
+    -- Every field quoted (not just ones that need it) - simpler,
+    -- unambiguous pairing with DataX's useTextQualifier reader config
+    -- (see job_spec.py) than leaving TPT to decide per-field which
+    -- ones need quoting. Preserves an embedded delimiter or CR/LF
+    -- inside a VARCHAR value unchanged, instead of the data itself
+    -- needing to change to survive export - confirmed live 2026-08-22:
+    -- a real column's embedded \r (not even \n) split one logical row
+    -- into two fragments downstream when unquoted.
+    VARCHAR QuotedData = 'Yes',
+    VARCHAR OpenQuoteMark = '"',
+    VARCHAR CloseQuoteMark = '"',
     VARCHAR OpenMode = 'Write',
     VARCHAR IndicatorMode = 'N'
   );
@@ -136,7 +147,14 @@ def build_select_stmt(
     When needs_cast, casts to tpt_type itself - resolve_column_types()
     already resolved tpt_type to whatever the CAST's target must be
     (FLOAT for DECIMAL-like columns, VARCHAR(n) for DATE/TIMESTAMP), so
-    the cast target is never hardcoded here."""
+    the cast target is never hardcoded here.
+
+    No sanitization of column values happens here - an embedded CR/LF
+    or delimiter character inside a VARCHAR value must survive export
+    unchanged. That's handled by quoting (_build_tpt_job_script's
+    QuotedData/OpenQuoteMark on the TPT side, csvReaderConfig's
+    useTextQualifier on the DataX read side - see job_spec.py), not by
+    altering the data itself."""
     exprs = [
         f'CAST("{name}" AS {tpt_type}) AS "{name}"' if needs_cast else f'"{name}"'
         for name, tpt_type, needs_cast in columns

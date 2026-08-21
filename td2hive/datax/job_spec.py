@@ -147,6 +147,27 @@ def build_job_json(
                     # as dirty data ("无法将[] 转换为[LONG]"), confirmed
                     # against real production data 2026-08-20.
                     "nullFormat": "",
+                    # Must match reader.py's TPT export, which now quotes
+                    # every field (QuotedData='Yes', OpenQuoteMark='"')
+                    # specifically so an embedded delimiter or CR/LF
+                    # inside a VARCHAR value survives unchanged instead
+                    # of corrupting row/field alignment downstream -
+                    # confirmed live: a real column's embedded \r (not
+                    # even \n) split one logical row into two fragments
+                    # when the export wasn't quoted. 34 is the ASCII code
+                    # for '"' - this reader's csvReaderConfig takes
+                    # character codes, not literal characters.
+                    # escapeMode is left at this reader's own default
+                    # (doubled-quote, "" -> one literal ") rather than
+                    # set explicitly here, since that's also TPT's own
+                    # default embedded-quote escaping - not guessing at
+                    # the right integer constant for an alternative mode
+                    # neither side actually needs.
+                    "csvReaderConfig": {
+                        "useTextQualifier": True,
+                        "textQualifier": 34,
+                        "safetySwitch": False,
+                    },
                 },
             },
             "writer": {
